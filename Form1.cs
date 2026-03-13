@@ -119,7 +119,8 @@ namespace DynamicIsland
 
         private const int BaseWindowWidth = 400;
         private const int BaseWindowHeight = 140;
-        private const int BaseIslandWidth = 140;
+        // 修改：增加基础尺寸，避免文字换行
+        private const int BaseIslandWidth = 144;
         private const int BaseIslandHeight = 40;
         private const int BaseExpandedWidth = 320;
         private const int BaseExpandedHeight = 70;
