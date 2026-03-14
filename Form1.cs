@@ -9,6 +9,55 @@ using Timer = System.Windows.Forms.Timer;
 
 namespace DynamicIsland
 {
+    public class ContentItem
+    {
+        public string Text { get; set; }
+        public Font Font { get; set; }
+        public Color Color { get; set; }
+        public float TargetScale { get; set; } = 1.0f;
+        public float CurrentScale { get; set; } = 0.0f;
+        public float CurrentAlpha { get; set; } = 0.0f;
+        public bool IsActive { get; set; } = false;
+        public DateTime ShowTime { get; set; }
+        public TimeSpan Duration { get; set; }
+
+        public float ScaleVelocity { get; set; } = 0.0f;
+        public float AlphaVelocity { get; set; } = 0.0f;
+        public const float SpringStrength = 0.15f;
+        public const float Damping = 0.75f;
+
+        public void UpdateAnimation(float deltaMs)
+        {
+            float dt = Math.Min(deltaMs / 1000f, 0.05f) * 60;
+
+            float scaleDisplacement = TargetScale - CurrentScale;
+            float scaleForce = scaleDisplacement * SpringStrength;
+            ScaleVelocity += scaleForce * dt;
+            ScaleVelocity *= Damping;
+            CurrentScale += ScaleVelocity * dt;
+
+            float targetAlpha = IsActive ? 255f : 0f;
+            float alphaDisplacement = targetAlpha - CurrentAlpha;
+            float alphaForce = alphaDisplacement * SpringStrength;
+            AlphaVelocity += alphaForce * dt;
+            AlphaVelocity *= Damping;
+            CurrentAlpha += AlphaVelocity * dt;
+
+            if (Math.Abs(scaleDisplacement) < 0.01f && Math.Abs(ScaleVelocity) < 0.01f)
+            {
+                CurrentScale = TargetScale;
+                ScaleVelocity = 0;
+            }
+            if (Math.Abs(alphaDisplacement) < 1f && Math.Abs(AlphaVelocity) < 1f)
+            {
+                CurrentAlpha = targetAlpha;
+                AlphaVelocity = 0;
+            }
+        }
+
+        public bool ShouldRemove => !IsActive && CurrentAlpha <= 1f;
+    }
+
     public class Form1 : Form
     {
         [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
@@ -68,7 +117,38 @@ namespace DynamicIsland
         [DllImport("shcore.dll")]
         private static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
 
+        [DllImport("user32.dll")]
+        private static extern bool BringWindowToTop(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindow(IntPtr hWnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        private static extern bool SetWindowPos(IntPtr hWnd, int hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
+        private const int SW_SHOWNOACTIVATE = 4;
+        private const uint SWP_NOSIZE = 0x0001;
+        private const uint SWP_NOMOVE = 0x0002;
+        private const uint SWP_NOACTIVATE = 0x0010;
+        private const uint SWP_SHOWWINDOW = 0x0040;
+        private const uint SWP_FRAMECHANGED = 0x0020;
+        private const uint SWP_NOSENDCHANGING = 0x0400;
+        private const uint TOPMOST_FLAGS = SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW;
+
         private const uint MONITOR_DEFAULTTONEAREST = 2;
+        private const uint TME_LEAVE = 0x00000002;
+        private const int GWL_EXSTYLE = -20;
+        private const int WS_EX_LAYERED = 0x80000;
+        private const int WS_EX_TOOLWINDOW = 0x80;
+        private const int WS_EX_TRANSPARENT = 0x20;
+        private const int WS_EX_NOACTIVATE = 0x08000000;
+        private const uint ULW_ALPHA = 0x02;
+        private const byte AC_SRC_OVER = 0x00;
+        private const byte AC_SRC_ALPHA = 0x01;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct POINT
@@ -85,21 +165,6 @@ namespace DynamicIsland
             public IntPtr hwndTrack;
             public uint dwHoverTime;
         }
-
-        private const uint TME_LEAVE = 0x00000002;
-        private const int GWL_EXSTYLE = -20;
-        private const int WS_EX_LAYERED = 0x80000;
-        private const int WS_EX_TOOLWINDOW = 0x80;
-        private const int WS_EX_TRANSPARENT = 0x20;
-        private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
-        private const uint SWP_NOSIZE = 0x0001;
-        private const uint SWP_NOMOVE = 0x0002;
-        private const uint SWP_NOACTIVATE = 0x0010;
-        private const uint SWP_SHOWWINDOW = 0x0040;
-        private const uint SWP_FRAMECHANGED = 0x0020;
-        private const uint ULW_ALPHA = 0x02;
-        private const byte AC_SRC_OVER = 0x00;
-        private const byte AC_SRC_ALPHA = 0x01;
 
         [StructLayout(LayoutKind.Sequential)]
         private struct BLENDFUNCTION
@@ -119,8 +184,7 @@ namespace DynamicIsland
 
         private const int BaseWindowWidth = 400;
         private const int BaseWindowHeight = 140;
-        // 修改：增加基础尺寸，避免文字换行
-        private const int BaseIslandWidth = 144;
+        private const int BaseIslandWidth = 150;
         private const int BaseIslandHeight = 40;
         private const int BaseExpandedWidth = 320;
         private const int BaseExpandedHeight = 70;
@@ -142,13 +206,11 @@ namespace DynamicIsland
         private bool _isExpanded = false;
 
         private System.Threading.Timer _renderTimer;
+        private System.Threading.Timer _topmostTimer;
         private readonly object _renderLock = new object();
         private long _lastTickTime;
-        private float _animStartWidth, _animStartHeight;
-        private float _animElapsed = 0f;
         private bool _isAnimating = false;
 
-        // 弹簧物理参数
         private float _velocityX = 0f;
         private float _velocityY = 0f;
         private const float SpringStrength = 0.12f;
@@ -160,8 +222,8 @@ namespace DynamicIsland
 
         private Font _timeFont;
         private Font _dateFont;
+        private Font _notificationFont;
         private StringFormat _stringFormat;
-        private Timer _clockTimer;
 
         private Bitmap _bufferBitmap;
         private Graphics _bufferGraphics;
@@ -174,6 +236,11 @@ namespace DynamicIsland
         private NotifyIcon _notifyIcon;
         private ContextMenuStrip _contextMenu;
         private bool _isExiting = false;
+
+        private ContentItem _currentContent;
+        private ContentItem _nextContent;
+        private Timer _autoPopupTimer;
+        private bool _isAutoPopupActive = false;
 
         public Form1()
         {
@@ -220,11 +287,21 @@ namespace DynamicIsland
             this.FormBorderStyle = FormBorderStyle.None;
             this.ShowInTaskbar = false;
             this.Load += Form1_Load;
+
             float timeFontSize = 17f * _dpiScale;
             float dateFontSize = 11f * _dpiScale;
+            float notificationFontSize = 22f * _dpiScale;
+
             _timeFont = new Font("Microsoft YaHei", timeFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
             _dateFont = new Font("Microsoft YaHei", dateFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
-            _stringFormat = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center };
+            _notificationFont = new Font("Microsoft YaHei", notificationFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
+
+            _stringFormat = new StringFormat
+            {
+                Alignment = StringAlignment.Center,
+                LineAlignment = StringAlignment.Center
+            };
+
             this.MouseMove += Form1_MouseMove;
             this.MouseLeave += Form1_MouseLeave;
         }
@@ -235,10 +312,14 @@ namespace DynamicIsland
             ToolStripMenuItem exitMenuItem = new ToolStripMenuItem("退出");
             exitMenuItem.Click += ExitMenuItem_Click;
             _contextMenu.Items.Add(exitMenuItem);
-            _notifyIcon = new NotifyIcon();
-            _notifyIcon.Text = "Dynamic Island";
-            _notifyIcon.Visible = true;
-            _notifyIcon.ContextMenuStrip = _contextMenu;
+
+            _notifyIcon = new NotifyIcon
+            {
+                Text = "Dynamic Island",
+                Visible = true,
+                ContextMenuStrip = _contextMenu
+            };
+
             try { _notifyIcon.Icon = SystemIcons.Application; }
             catch
             {
@@ -248,33 +329,77 @@ namespace DynamicIsland
                     _notifyIcon.Icon = Icon.FromHandle(bmp.GetHicon());
                 }
             }
-            _notifyIcon.DoubleClick += NotifyIcon_DoubleClick;
-        }
-
-        private void NotifyIcon_DoubleClick(object sender, EventArgs e)
-        {
-            if (this.Visible) this.Hide();
-            else
-            {
-                this.Show();
-                SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
-            }
         }
 
         private void ExitMenuItem_Click(object sender, EventArgs e)
         {
+            // 先标记退出状态，防止重复触发
+            if (_isExiting) return;
             _isExiting = true;
-            _notifyIcon.Visible = false;
-            _notifyIcon.Dispose();
-            Application.Exit();
+
+            // 使用 BeginInvoke 延迟执行退出，确保上下文菜单先关闭
+            this.BeginInvoke(new Action(() =>
+            {
+                try
+                {
+                    // 先隐藏托盘图标，再清理资源
+                    if (_notifyIcon != null)
+                    {
+                        _notifyIcon.Visible = false;
+                    }
+
+                    // 清理其他资源
+                    CleanupResources();
+
+                    // 退出应用
+                    Application.Exit();
+                }
+                catch (Exception ex)
+                {
+                    // 如果出错，强制退出
+                    Environment.Exit(0);
+                }
+            }));
+        }
+
+        // 集中清理资源
+        private void CleanupResources()
+        {
+            _renderTimer?.Dispose();
+            _topmostTimer?.Dispose();
+            _mousePollingTimer?.Stop();
+            _mousePollingTimer?.Dispose();
+            _autoPopupTimer?.Stop();
+            _autoPopupTimer?.Dispose();
+
+            _currentContent = null;
+            _nextContent = null;
+
+            _timeFont?.Dispose();
+            _dateFont?.Dispose();
+            _notificationFont?.Dispose();
+            _stringFormat?.Dispose();
+            _bufferGraphics?.Dispose();
+            _bufferBitmap?.Dispose();
+            _shadowBitmap?.Dispose();
+
+            if (_notifyIcon != null)
+            {
+                _notifyIcon.Dispose();
+                _notifyIcon = null;
+            }
+            _contextMenu?.Dispose();
         }
 
         private void Form1_Load(object sender, EventArgs e)
         {
             InitializeTrayIcon();
+
             int exStyle = GetWindowLong(this.Handle, GWL_EXSTYLE);
-            SetWindowLong(this.Handle, GWL_EXSTYLE, exStyle | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT);
-            SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW | SWP_FRAMECHANGED);
+            SetWindowLong(this.Handle, GWL_EXSTYLE, exStyle | WS_EX_LAYERED | WS_EX_TOOLWINDOW | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+
+            ForceSuperTopMost();
+
             _bufferBitmap = new Bitmap(WindowWidth, WindowHeight, PixelFormat.Format32bppPArgb);
             _bufferGraphics = Graphics.FromImage(_bufferBitmap);
             _bufferGraphics.SmoothingMode = SmoothingMode.AntiAlias;
@@ -282,24 +407,184 @@ namespace DynamicIsland
             _bufferGraphics.CompositingQuality = CompositingQuality.HighQuality;
             _bufferGraphics.InterpolationMode = InterpolationMode.HighQualityBicubic;
             _bufferGraphics.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            _clockTimer = new Timer { Interval = 1000 };
-            _clockTimer.Tick += (s, ev) => RequestRender();
-            _clockTimer.Start();
+
+            _currentContent = new ContentItem
+            {
+                Text = DateTime.Now.ToString("HH:mm:ss"),
+                Font = _timeFont,
+                Color = Color.White,
+                TargetScale = 1.0f,
+                CurrentScale = 1.0f,
+                CurrentAlpha = 255f,
+                IsActive = true,
+                Duration = TimeSpan.Zero
+            };
+
             _mousePollingTimer = new Timer { Interval = 8 };
             _mousePollingTimer.Tick += MousePollingTimer_Tick;
             _mousePollingTimer.Start();
+
             _lastTickTime = DateTime.UtcNow.Ticks;
             _renderTimer = new System.Threading.Timer(RenderTick, null, 0, 8);
+
+            _topmostTimer = new System.Threading.Timer(EnsureSuperTopMost, null, 0, 100);
+
+            ShowStartupNotification();
             RequestRender();
+        }
+
+        private void ForceSuperTopMost()
+        {
+            if (this.IsDisposed || !this.IsHandleCreated) return;
+
+            SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0, TOPMOST_FLAGS);
+            BringWindowToTop(this.Handle);
+            SetWindowPos(this.Handle, -1, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+            ShowWindow(this.Handle, SW_SHOWNOACTIVATE);
+        }
+
+        private void EnsureSuperTopMost(object state)
+        {
+            if (this.IsDisposed || !this.IsHandleCreated || _isExiting) return;
+
+            try
+            {
+                this.BeginInvoke(new Action(() =>
+                {
+                    if (this.IsDisposed || !this.IsHandleCreated) return;
+
+                    SetWindowPos(this.Handle, -1, 0, 0, 0, 0,
+                        SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOSENDCHANGING);
+                }));
+            }
+            catch { }
+        }
+
+        private void ShowStartupNotification()
+        {
+            _isAutoPopupActive = true;
+            SetExpanded(true);
+
+            var startupItem = new ContentItem
+            {
+                Text = "灵动岛已启动",
+                Font = _notificationFont,
+                Color = Color.White,
+                TargetScale = 1.0f,
+                CurrentScale = 0.5f,
+                CurrentAlpha = 0f,
+                IsActive = true,
+                Duration = TimeSpan.FromSeconds(2)
+            };
+
+            TransitionToContent(startupItem);
+
+            _autoPopupTimer = new Timer { Interval = 2000 };
+            _autoPopupTimer.Tick += (s, e) =>
+            {
+                _autoPopupTimer.Stop();
+                _autoPopupTimer.Dispose();
+                _autoPopupTimer = null;
+
+                var timeItem = new ContentItem
+                {
+                    Text = DateTime.Now.ToString("HH:mm:ss"),
+                    Font = _timeFont,
+                    Color = Color.White,
+                    TargetScale = 1.0f,
+                    CurrentScale = 0.8f,
+                    CurrentAlpha = 0f,
+                    IsActive = true,
+                    Duration = TimeSpan.Zero
+                };
+
+                TransitionToContent(timeItem);
+                SetExpanded(false);
+                _isAutoPopupActive = false;
+            };
+            _autoPopupTimer.Start();
+        }
+
+        public void ShowNotification(string text, TimeSpan duration, Font customFont = null, Color? customColor = null)
+        {
+            if (InvokeRequired)
+            {
+                Invoke(new Action<string, TimeSpan, Font, Color?>(ShowNotification), text, duration, customFont, customColor);
+                return;
+            }
+
+            _isAutoPopupActive = true;
+            SetExpanded(true);
+
+            var notification = new ContentItem
+            {
+                Text = text,
+                Font = customFont ?? _notificationFont,
+                Color = customColor ?? Color.White,
+                TargetScale = 1.0f,
+                CurrentScale = 0.5f,
+                CurrentAlpha = 0f,
+                IsActive = true,
+                Duration = duration
+            };
+
+            TransitionToContent(notification);
+
+            if (duration > TimeSpan.Zero)
+            {
+                _autoPopupTimer?.Stop();
+                _autoPopupTimer?.Dispose();
+                _autoPopupTimer = new Timer { Interval = (int)duration.TotalMilliseconds };
+                _autoPopupTimer.Tick += (s, e) =>
+                {
+                    _autoPopupTimer.Stop();
+                    _autoPopupTimer.Dispose();
+                    _autoPopupTimer = null;
+
+                    var timeItem = new ContentItem
+                    {
+                        Text = DateTime.Now.ToString("HH:mm:ss"),
+                        Font = _timeFont,
+                        Color = Color.White,
+                        TargetScale = 1.0f,
+                        CurrentScale = 0.8f,
+                        CurrentAlpha = 0f,
+                        IsActive = true,
+                        Duration = TimeSpan.Zero
+                    };
+
+                    TransitionToContent(timeItem);
+                    SetExpanded(false);
+                    _isAutoPopupActive = false;
+                };
+                _autoPopupTimer.Start();
+            }
+        }
+
+        private void TransitionToContent(ContentItem newContent)
+        {
+            if (_currentContent != null)
+            {
+                _currentContent.IsActive = false;
+                _nextContent = newContent;
+            }
+            else
+            {
+                _currentContent = newContent;
+            }
+            _isAnimating = true;
         }
 
         private void MousePollingTimer_Tick(object sender, EventArgs e)
         {
+            if (_isAutoPopupActive) return;
+
             if (GetCursorPos(out POINT pt))
             {
                 var islandScreenRect = GetIslandScreenRect();
                 float hitPadding = 8 * _dpiScale;
-                var hitRect = new RectangleF(islandScreenRect.X - hitPadding, islandScreenRect.Y - hitPadding, islandScreenRect.Width + hitPadding * 2, islandScreenRect.Height + hitPadding * 2);
+                var hitRect = new RectangleF(islandScreenRect.X - hitPadding, islandScreenRect.Y - hitPadding,
+                    islandScreenRect.Width + hitPadding * 2, islandScreenRect.Height + hitPadding * 2);
                 bool inside = hitRect.Contains(pt.X, pt.Y);
                 if (inside != _mouseInside)
                 {
@@ -319,7 +604,13 @@ namespace DynamicIsland
         {
             if (!_mouseTracking)
             {
-                TRACKMOUSEEVENT tme = new TRACKMOUSEEVENT { cbSize = (uint)Marshal.SizeOf(typeof(TRACKMOUSEEVENT)), dwFlags = TME_LEAVE, hwndTrack = this.Handle, dwHoverTime = 0 };
+                TRACKMOUSEEVENT tme = new TRACKMOUSEEVENT
+                {
+                    cbSize = (uint)Marshal.SizeOf(typeof(TRACKMOUSEEVENT)),
+                    dwFlags = TME_LEAVE,
+                    hwndTrack = this.Handle,
+                    dwHoverTime = 0
+                };
                 TrackMouseEvent(ref tme);
                 _mouseTracking = true;
             }
@@ -355,14 +646,26 @@ namespace DynamicIsland
             _currentWidth += _velocityX * dt * 60;
             _currentHeight += _velocityY * dt * 60;
             float threshold = 0.3f * _dpiScale;
-            if (Math.Abs(displacementX) < threshold && Math.Abs(_velocityX) < threshold && Math.Abs(displacementY) < threshold && Math.Abs(_velocityY) < threshold)
+            if (Math.Abs(displacementX) < threshold && Math.Abs(_velocityX) < threshold &&
+                Math.Abs(displacementY) < threshold && Math.Abs(_velocityY) < threshold)
             {
                 _currentWidth = _targetWidth;
                 _currentHeight = _targetHeight;
-                _isAnimating = false;
+                if (!IsContentAnimating()) _isAnimating = false;
                 _velocityX = 0f;
                 _velocityY = 0f;
             }
+        }
+
+        private bool IsContentAnimating()
+        {
+            if (_currentContent != null && (_currentContent.CurrentAlpha > 1f || _currentContent.CurrentAlpha < 254f ||
+                Math.Abs(_currentContent.CurrentScale - _currentContent.TargetScale) > 0.01f))
+                return true;
+            if (_nextContent != null && (_nextContent.CurrentAlpha > 1f || _nextContent.CurrentAlpha < 254f ||
+                Math.Abs(_nextContent.CurrentScale - _nextContent.TargetScale) > 0.01f))
+                return true;
+            return false;
         }
 
         private void RenderTick(object state)
@@ -370,15 +673,49 @@ namespace DynamicIsland
             long now = DateTime.UtcNow.Ticks;
             float deltaMs = (now - _lastTickTime) / 10000f;
             _lastTickTime = now;
+
             bool needsRender = false;
             lock (_renderLock)
             {
-                if (_isAnimating)
+                if (_isExpanded || Math.Abs(_currentWidth - _targetWidth) > 0.1f)
                 {
                     UpdateSpringAnimation(deltaMs);
                     needsRender = true;
                 }
+
+                if (_currentContent != null)
+                {
+                    _currentContent.UpdateAnimation(deltaMs);
+                    if (_currentContent.ShouldRemove)
+                    {
+                        _currentContent = null;
+                    }
+                    needsRender = true;
+                }
+
+                if (_nextContent != null)
+                {
+                    _nextContent.UpdateAnimation(deltaMs);
+                    if (_nextContent.CurrentAlpha > 200 && _currentContent != null && _currentContent.CurrentAlpha < 50)
+                    {
+                        _currentContent = _nextContent;
+                        _nextContent = null;
+                    }
+                    needsRender = true;
+                }
+
+                if (_currentContent != null && _currentContent.Duration == TimeSpan.Zero &&
+                    _currentContent.Font == _timeFont && !_isAutoPopupActive)
+                {
+                    string newTime = DateTime.Now.ToString("HH:mm:ss");
+                    if (newTime != _currentContent.Text)
+                    {
+                        _currentContent.Text = newTime;
+                        needsRender = true;
+                    }
+                }
             }
+
             if (needsRender)
             {
                 try { this.BeginInvoke(new Action(RequestRender)); }
@@ -414,51 +751,97 @@ namespace DynamicIsland
             var g = _bufferGraphics;
             var islandRect = GetIslandRect();
             float radius = GetCurrentRadius();
+
             g.Clear(Color.Transparent);
             DrawShadow(g, islandRect, radius, shadowOpacity);
+
             float expandProgress = (_currentWidth - IslandWidth) / (float)(ExpandedWidth - IslandWidth);
             expandProgress = Math.Max(0, Math.Min(1, expandProgress));
 
-            // 透明度：缩小80%，展开100%
-            int bodyAlpha = expandProgress > 0.9f ? 255 : (int)(204 + expandProgress * 51);
-
+            int bodyAlpha = expandProgress > 0.9f ? 255 : (int)(155 + expandProgress * 100);
             using (var brush = new SolidBrush(Color.FromArgb(bodyAlpha, 0, 0, 0)))
             using (var path = GetRoundedRect(islandRect, radius))
             {
                 g.FillPath(brush, path);
             }
-            int highlightAlpha = (int)(20 + expandProgress * 20);
-            using (var pen = new Pen(Color.FromArgb(highlightAlpha, 255, 255, 255), 1f * _dpiScale))
+
+            int highlightAlpha = (int)(30 + expandProgress * 30);
+            using (var pen = new Pen(Color.FromArgb(highlightAlpha, 255, 255, 255), 2f * _dpiScale))
             {
-                float offset = 1f * _dpiScale;
-                var innerRect = new RectangleF(islandRect.X + offset, islandRect.Y + offset, islandRect.Width - offset * 2, islandRect.Height - offset * 2);
-                using (var path = GetRoundedRect(innerRect, radius - offset)) g.DrawPath(pen, path);
+                float offset = 0.5f * _dpiScale;
+                var highlightRect = new RectangleF(islandRect.X + offset, islandRect.Y + offset,
+                    islandRect.Width - offset * 2, islandRect.Height - offset * 2);
+                using (var path = GetRoundedRect(highlightRect, radius - offset))
+                    g.DrawPath(pen, path);
             }
-            string timeStr = DateTime.Now.ToString("HH:mm:ss");
-            var timeRect = new RectangleF(islandRect.X, islandRect.Y + 2 * _dpiScale, islandRect.Width, islandRect.Height);
-            using (var brush = new SolidBrush(Color.White)) g.DrawString(timeStr, _timeFont, brush, timeRect, _stringFormat);
-            if (_isExpanded || _isAnimating)
+
+            DrawContent(g, islandRect);
+
+            if ((_isExpanded || _isAnimating) && !_isAutoPopupActive && expandProgress > 0.3f)
             {
-                float progress = (_currentWidth - IslandWidth) / (float)(ExpandedWidth - IslandWidth);
-                progress = Math.Max(0, Math.Min(1, progress));
-                if (progress > 0.3f)
+                int dateAlpha = (int)(255 * Math.Min(1f, (expandProgress - 0.3f) / 0.7f));
+                string dateStr = DateTime.Now.ToString("MM/dd");
+                using (var brush = new SolidBrush(Color.FromArgb(dateAlpha, 200, 200, 200)))
                 {
-                    int alpha = (int)(255 * Math.Min(1f, (progress - 0.3f) / 0.7f));
-                    string dateStr = DateTime.Now.ToString("MM/dd");
-                    using (var brush = new SolidBrush(Color.FromArgb(alpha, 200, 200, 200)))
-                    {
-                        float dateWidth = 70 * _dpiScale;
-                        float dateHeight = 24 * _dpiScale;
-                        var dateRect = new RectangleF(islandRect.Right - dateWidth - 5 * _dpiScale, islandRect.Y + (islandRect.Height - dateHeight) / 2, dateWidth, dateHeight);
-                        g.DrawString(dateStr, _dateFont, brush, dateRect, _stringFormat);
-                    }
+                    float dateWidth = 70 * _dpiScale;
+                    float dateHeight = 24 * _dpiScale;
+                    var dateRect = new RectangleF(islandRect.Right - dateWidth - 5 * _dpiScale,
+                        islandRect.Y + (islandRect.Height - dateHeight) / 2, dateWidth, dateHeight);
+                    g.DrawString(dateStr, _dateFont, brush, dateRect, _stringFormat);
                 }
             }
         }
 
+        private void DrawContent(Graphics g, RectangleF islandRect)
+        {
+            if (_currentContent != null && _currentContent.CurrentAlpha > 0)
+            {
+                DrawContentItem(g, islandRect, _currentContent);
+            }
+
+            if (_nextContent != null && _nextContent.CurrentAlpha > 0)
+            {
+                DrawContentItem(g, islandRect, _nextContent);
+            }
+        }
+
+        private void DrawContentItem(Graphics g, RectangleF islandRect, ContentItem item)
+        {
+            if (item.CurrentAlpha <= 0) return;
+
+            int alpha = Math.Max(0, Math.Min(255, (int)item.CurrentAlpha));
+            var color = Color.FromArgb(alpha, item.Color.R, item.Color.G, item.Color.B);
+
+            float scale = item.CurrentScale;
+            float centerX = islandRect.X + islandRect.Width / 2;
+            float centerY = islandRect.Y + islandRect.Height / 2;
+
+            var state = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+            var matrix = new Matrix();
+            matrix.Translate(centerX, centerY);
+            matrix.Scale(scale, scale);
+            matrix.Translate(-centerX, -centerY);
+            g.Transform = matrix;
+
+            using (var brush = new SolidBrush(color))
+            {
+                g.DrawString(item.Text, item.Font, brush,
+                    new RectangleF(islandRect.X, islandRect.Y + 2 * _dpiScale, islandRect.Width, islandRect.Height),
+                    _stringFormat);
+            }
+
+            g.Restore(state);
+        }
+
         private void DrawShadow(Graphics g, RectangleF islandRect, float radius, float shadowOpacity)
         {
-            bool needRegenerate = _shadowBitmap == null || Math.Abs(_lastShadowWidth - islandRect.Width) > 2 || Math.Abs(_lastShadowHeight - islandRect.Height) > 2;
+            bool needRegenerate = _shadowBitmap == null ||
+                Math.Abs(_lastShadowWidth - islandRect.Width) > 2 ||
+                Math.Abs(_lastShadowHeight - islandRect.Height) > 2;
+
             if (needRegenerate)
             {
                 _shadowBitmap?.Dispose();
@@ -466,16 +849,26 @@ namespace DynamicIsland
                 _lastShadowWidth = islandRect.Width;
                 _lastShadowHeight = islandRect.Height;
             }
+
             if (_shadowBitmap != null)
             {
                 float shadowPadding = 15f * _dpiScale;
                 float offsetY = 4f * _dpiScale;
-                float[][] matrixItems = new float[][] { new float[] { 1, 0, 0, 0, 0 }, new float[] { 0, 1, 0, 0, 0 }, new float[] { 0, 0, 1, 0, 0 }, new float[] { 0, 0, 0, shadowOpacity, 0 }, new float[] { 0, 0, 0, 0, 1 } };
+                float[][] matrixItems = new float[][] {
+                    new float[] { 1, 0, 0, 0, 0 },
+                    new float[] { 0, 1, 0, 0, 0 },
+                    new float[] { 0, 0, 1, 0, 0 },
+                    new float[] { 0, 0, 0, shadowOpacity, 0 },
+                    new float[] { 0, 0, 0, 0, 1 }
+                };
                 ColorMatrix colorMatrix = new ColorMatrix(matrixItems);
                 using (var imageAttributes = new ImageAttributes())
                 {
                     imageAttributes.SetColorMatrix(colorMatrix, ColorMatrixFlag.Default, ColorAdjustType.Bitmap);
-                    g.DrawImage(_shadowBitmap, new Rectangle((int)(islandRect.X - shadowPadding), (int)(islandRect.Y - shadowPadding + offsetY), _shadowBitmap.Width, _shadowBitmap.Height), 0, 0, _shadowBitmap.Width, _shadowBitmap.Height, GraphicsUnit.Pixel, imageAttributes);
+                    g.DrawImage(_shadowBitmap,
+                        new Rectangle((int)(islandRect.X - shadowPadding), (int)(islandRect.Y - shadowPadding + offsetY),
+                            _shadowBitmap.Width, _shadowBitmap.Height),
+                        0, 0, _shadowBitmap.Width, _shadowBitmap.Height, GraphicsUnit.Pixel, imageAttributes);
                 }
             }
         }
@@ -496,7 +889,8 @@ namespace DynamicIsland
                     int alpha = (int)(10 * (1f - (float)i / 8));
                     var shadowRect = new RectangleF(padding - expand, padding - expand, width + expand * 2, height + expand * 2);
                     using (var brush = new SolidBrush(Color.FromArgb(alpha, 0, 0, 0)))
-                    using (var path = GetRoundedRect(shadowRect, radius + expand)) g.FillPath(brush, path);
+                    using (var path = GetRoundedRect(shadowRect, radius + expand))
+                        g.FillPath(brush, path);
                 }
             }
             return bitmap;
@@ -532,7 +926,13 @@ namespace DynamicIsland
                 Win32Point pptDst = new Win32Point(this.Left, this.Top);
                 Size psize = new Size(this.Width, this.Height);
                 Win32Point pptSrc = new Win32Point(0, 0);
-                BLENDFUNCTION blend = new BLENDFUNCTION { BlendOp = AC_SRC_OVER, BlendFlags = 0, SourceConstantAlpha = 255, AlphaFormat = AC_SRC_ALPHA };
+                BLENDFUNCTION blend = new BLENDFUNCTION
+                {
+                    BlendOp = AC_SRC_OVER,
+                    BlendFlags = 0,
+                    SourceConstantAlpha = 255,
+                    AlphaFormat = AC_SRC_ALPHA
+                };
                 UpdateLayeredWindow(this.Handle, screenDc, ref pptDst, ref psize, memDc, ref pptSrc, 0, ref blend, ULW_ALPHA);
             }
             finally
@@ -546,20 +946,15 @@ namespace DynamicIsland
 
         protected override void OnFormClosing(FormClosingEventArgs e)
         {
-            if (!_isExiting) { e.Cancel = true; this.Hide(); return; }
-            _renderTimer?.Dispose();
-            _mousePollingTimer?.Stop();
-            _mousePollingTimer?.Dispose();
-            _clockTimer?.Stop();
-            _clockTimer?.Dispose();
-            _timeFont?.Dispose();
-            _dateFont?.Dispose();
-            _stringFormat?.Dispose();
-            _bufferGraphics?.Dispose();
-            _bufferBitmap?.Dispose();
-            _shadowBitmap?.Dispose();
-            _notifyIcon?.Dispose();
-            _contextMenu?.Dispose();
+            if (!_isExiting)
+            {
+                e.Cancel = true;
+                this.Hide();
+                return;
+            }
+
+            // 如果正在退出，执行清理
+            CleanupResources();
             base.OnFormClosing(e);
         }
 
