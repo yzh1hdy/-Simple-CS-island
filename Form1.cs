@@ -9,6 +9,7 @@ using System.Management;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
+using System.Threading;
 
 namespace DynamicIsland
 {
@@ -63,6 +64,12 @@ namespace DynamicIsland
 
     public class Form1 : Form
     {
+        // 重复运行检测相关
+        private const string MUTEX_NAME = "DynamicIsland_SingleInstance_Mutex_v1";
+        private const string WM_SHOWINSTANCE = "WM_DynamicIsland_ShowInstance";
+        private static Mutex _mutex;
+        private static int WM_SHOWINSTANCE_MESSAGE;
+
         // DPI 感知 API
         [DllImport("shcore.dll")]
         private static extern int SetProcessDpiAwareness(int awareness);
@@ -85,6 +92,9 @@ namespace DynamicIsland
                 }
                 catch { }
             }
+
+            // 注册窗口消息
+            WM_SHOWINSTANCE_MESSAGE = (int)RegisterWindowMessage(WM_SHOWINSTANCE);
         }
 
         [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
@@ -149,6 +159,24 @@ namespace DynamicIsland
 
         [DllImport("user32.dll", SetLastError = true)]
         private static extern bool SetWindowPos(IntPtr hWnd, int hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
+
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        private static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+
+        [DllImport("user32.dll")]
+        private static extern bool PostMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SendMessage(IntPtr hWnd, uint Msg, IntPtr wParam, IntPtr lParam);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        private static extern uint RegisterWindowMessage(string lpString);
+
+        [DllImport("user32.dll")]
+        private static extern bool IsWindowVisible(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern bool SetForegroundWindow(IntPtr hWnd);
 
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private const int SW_SHOWNOACTIVATE = 4;
@@ -269,6 +297,74 @@ namespace DynamicIsland
         private string _lastSSID = null;
         private HashSet<string> _lastBluetoothDevices = new HashSet<string>();
         private readonly object _hardwareLock = new object();
+
+        /// <summary>
+        /// 检查是否已有实例在运行
+        /// </summary>
+        public static bool IsAlreadyRunning()
+        {
+            bool createdNew;
+            _mutex = new Mutex(true, MUTEX_NAME, out createdNew);
+            return !createdNew;
+        }
+
+        /// <summary>
+        /// 激活已存在的实例
+        /// </summary>
+        public static void ActivateExistingInstance()
+        {
+            try
+            {
+                // 确保消息已注册
+                if (WM_SHOWINSTANCE_MESSAGE == 0)
+                {
+                    WM_SHOWINSTANCE_MESSAGE = (int)RegisterWindowMessage(WM_SHOWINSTANCE);
+                }
+
+                // 查找已存在的窗口 - 使用更可靠的查找方式
+                IntPtr hWnd = IntPtr.Zero;
+
+                // 先尝试通过窗口标题查找
+                hWnd = FindWindow(null, "Dynamic Island");
+
+                // 如果没找到，尝试枚举所有窗口（备用方案）
+                if (hWnd == IntPtr.Zero)
+                {
+                    // 尝试通过进程名查找
+                    Process currentProcess = Process.GetCurrentProcess();
+                    Process[] processes = Process.GetProcessesByName(currentProcess.ProcessName);
+
+                    foreach (Process process in processes)
+                    {
+                        if (process.Id != currentProcess.Id && process.MainWindowHandle != IntPtr.Zero)
+                        {
+                            hWnd = process.MainWindowHandle;
+                            break;
+                        }
+                    }
+                }
+
+                if (hWnd != IntPtr.Zero)
+                {
+                    // 确保窗口可见并置顶
+                    if (!IsWindowVisible(hWnd))
+                    {
+                        ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE
+                    }
+
+                    // 使用 SendMessage 确保消息被处理（同步）
+                    SendMessage(hWnd, (uint)WM_SHOWINSTANCE_MESSAGE, IntPtr.Zero, IntPtr.Zero);
+
+                    // 尝试将窗口带到前台
+                    SetForegroundWindow(hWnd);
+                }
+            }
+            catch (Exception ex)
+            {
+                // 可以在这里添加日志记录
+                Debug.WriteLine($"ActivateExistingInstance error: {ex.Message}");
+            }
+        }
 
         public Form1()
         {
@@ -668,7 +764,7 @@ namespace DynamicIsland
             {
                 Text = "C#灵动岛已启动",
                 Font = _notificationFont,
-                Color = Color.White,
+                Color = Color.FromArgb(180, 229, 162),
                 TargetScale = 1.0f,
                 CurrentScale = 0.5f,
                 CurrentAlpha = 0f,
@@ -1141,6 +1237,22 @@ namespace DynamicIsland
                 if (memDc != IntPtr.Zero) DeleteDC(memDc);
                 if (screenDc != IntPtr.Zero) ReleaseDC(IntPtr.Zero, screenDc);
             }
+        }
+
+        protected override void WndProc(ref Message m)
+        {
+            // 检查是否是我们的自定义消息
+            if (m.Msg == WM_SHOWINSTANCE_MESSAGE)
+            {
+                // 收到新实例启动的消息，显示"已启动"通知
+                this.BeginInvoke(new Action(() =>
+                {
+                    ShowNotification("请勿重复启动", TimeSpan.FromSeconds(2), customColor: Color.FromArgb(180, 229, 162));
+                }));
+                m.Result = IntPtr.Zero;
+                return;
+            }
+            base.WndProc(ref m);
         }
 
         protected override void OnFormClosing(FormClosingEventArgs e)
