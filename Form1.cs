@@ -10,20 +10,27 @@ using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
+using System.Windows.Forms;
 
 namespace DynamicIsland
 {
     public class ContentItem
     {
         public string Text { get; set; }
+        public string SubText { get; set; }
         public Font Font { get; set; }
+        public Font SubFont { get; set; }
         public Color Color { get; set; }
+        public Color SubColor { get; set; }
         public float TargetScale { get; set; } = 1.0f;
         public float CurrentScale { get; set; } = 0.0f;
         public float CurrentAlpha { get; set; } = 0.0f;
         public bool IsActive { get; set; } = false;
         public DateTime ShowTime { get; set; }
         public TimeSpan Duration { get; set; }
+        public bool IsClickable { get; set; } = false;
+        public Action OnConfirm { get; set; }
+        public Action OnCancel { get; set; }
 
         public float ScaleVelocity { get; set; } = 0.0f;
         public float AlphaVelocity { get; set; } = 0.0f;
@@ -64,25 +71,28 @@ namespace DynamicIsland
 
     public class Form1 : Form
     {
-        // 重复运行检测相关
         private const string MUTEX_NAME = "DynamicIsland_SingleInstance_Mutex_v1";
         private const string WM_SHOWINSTANCE = "WM_DynamicIsland_ShowInstance";
         private static Mutex _mutex;
         private static int WM_SHOWINSTANCE_MESSAGE;
 
-        // DPI 感知 API
+        // Clipboard monitoring
+        private const int WM_CLIPBOARDUPDATE = 0x031D;
+        private string _lastClipboardText = "";
+        private DateTime _lastClipboardCheck = DateTime.MinValue;
+        private readonly TimeSpan _clipboardDebounce = TimeSpan.FromSeconds(2);
+
         [DllImport("shcore.dll")]
         private static extern int SetProcessDpiAwareness(int awareness);
 
         [DllImport("user32.dll")]
         private static extern bool SetProcessDPIAware();
 
-        // 静态构造函数，在类首次使用时执行，设置 DPI 感知
         static Form1()
         {
             try
             {
-                SetProcessDpiAwareness(2); // Per-Monitor DPI Aware
+                SetProcessDpiAwareness(2);
             }
             catch
             {
@@ -92,8 +102,6 @@ namespace DynamicIsland
                 }
                 catch { }
             }
-
-            // 注册窗口消息
             WM_SHOWINSTANCE_MESSAGE = (int)RegisterWindowMessage(WM_SHOWINSTANCE);
         }
 
@@ -178,6 +186,14 @@ namespace DynamicIsland
         [DllImport("user32.dll")]
         private static extern bool SetForegroundWindow(IntPtr hWnd);
 
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool AddClipboardFormatListener(IntPtr hwnd);
+
+        [DllImport("user32.dll", SetLastError = true)]
+        [return: MarshalAs(UnmanagedType.Bool)]
+        private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
+
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private const int SW_SHOWNOACTIVATE = 4;
         private const uint SWP_NOSIZE = 0x0001;
@@ -231,6 +247,7 @@ namespace DynamicIsland
             public Win32Point(int x, int y) { this.x = x; this.y = y; }
         }
 
+        // 窗口宽度改回400
         private const int BaseWindowWidth = 400;
         private const int BaseWindowHeight = 140;
         private const int BaseIslandWidth = 150;
@@ -272,6 +289,9 @@ namespace DynamicIsland
         private Font _timeFont;
         private Font _dateFont;
         private Font _notificationFont;
+        private Font _linkFont;
+        private Font _buttonFont;
+        private Font _promptFont;      // 提示文字字体（稍大）
         private StringFormat _stringFormat;
 
         private Bitmap _bufferBitmap;
@@ -291,16 +311,17 @@ namespace DynamicIsland
         private System.Windows.Forms.Timer _autoPopupTimer;
         private bool _isAutoPopupActive = false;
 
-        // 硬件监控相关
         private System.Threading.Timer _hardwareMonitorTimer;
         private bool _wasOnline = false;
         private string _lastSSID = null;
         private HashSet<string> _lastBluetoothDevices = new HashSet<string>();
         private readonly object _hardwareLock = new object();
 
-        /// <summary>
-        /// 检查是否已有实例在运行
-        /// </summary>
+        private bool _isLinkDialogActive = false;
+        private string _pendingLink = null;
+        private RectangleF _confirmButtonRect;
+        private bool _isClickableMode = false;
+
         public static bool IsAlreadyRunning()
         {
             bool createdNew;
@@ -308,29 +329,20 @@ namespace DynamicIsland
             return !createdNew;
         }
 
-        /// <summary>
-        /// 激活已存在的实例
-        /// </summary>
         public static void ActivateExistingInstance()
         {
             try
             {
-                // 确保消息已注册
                 if (WM_SHOWINSTANCE_MESSAGE == 0)
                 {
                     WM_SHOWINSTANCE_MESSAGE = (int)RegisterWindowMessage(WM_SHOWINSTANCE);
                 }
 
-                // 查找已存在的窗口 - 使用更可靠的查找方式
                 IntPtr hWnd = IntPtr.Zero;
-
-                // 先尝试通过窗口标题查找
                 hWnd = FindWindow(null, "Dynamic Island");
 
-                // 如果没找到，尝试枚举所有窗口（备用方案）
                 if (hWnd == IntPtr.Zero)
                 {
-                    // 尝试通过进程名查找
                     Process currentProcess = Process.GetCurrentProcess();
                     Process[] processes = Process.GetProcessesByName(currentProcess.ProcessName);
 
@@ -346,22 +358,16 @@ namespace DynamicIsland
 
                 if (hWnd != IntPtr.Zero)
                 {
-                    // 确保窗口可见并置顶
                     if (!IsWindowVisible(hWnd))
                     {
-                        ShowWindow(hWnd, 4); // SW_SHOWNOACTIVATE
+                        ShowWindow(hWnd, 4);
                     }
-
-                    // 使用 SendMessage 确保消息被处理（同步）
                     SendMessage(hWnd, (uint)WM_SHOWINSTANCE_MESSAGE, IntPtr.Zero, IntPtr.Zero);
-
-                    // 尝试将窗口带到前台
                     SetForegroundWindow(hWnd);
                 }
             }
             catch (Exception ex)
             {
-                // 可以在这里添加日志记录
                 Debug.WriteLine($"ActivateExistingInstance error: {ex.Message}");
             }
         }
@@ -408,10 +414,16 @@ namespace DynamicIsland
             float timeFontSize = 17f * _dpiScale;
             float dateFontSize = 11f * _dpiScale;
             float notificationFontSize = 22f * _dpiScale;
+            float linkFontSize = 12f * _dpiScale;
+            float buttonFontSize = 13f * _dpiScale;
+            float promptFontSize = 15f * _dpiScale;  // 提示文字稍大
 
             _timeFont = new Font("Microsoft YaHei", timeFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
             _dateFont = new Font("Microsoft YaHei", dateFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
             _notificationFont = new Font("Microsoft YaHei", notificationFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
+            _linkFont = new Font("Microsoft YaHei", linkFontSize, FontStyle.Regular, GraphicsUnit.Pixel);
+            _buttonFont = new Font("Microsoft YaHei", buttonFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
+            _promptFont = new Font("Microsoft YaHei", promptFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
 
             _stringFormat = new StringFormat
             {
@@ -421,6 +433,8 @@ namespace DynamicIsland
 
             this.MouseMove += Form1_MouseMove;
             this.MouseLeave += Form1_MouseLeave;
+            this.MouseDown += Form1_MouseDown;
+            this.MouseUp += Form1_MouseUp;
         }
 
         private void InitializeTrayIcon()
@@ -473,6 +487,11 @@ namespace DynamicIsland
 
         private void CleanupResources()
         {
+            if (this.IsHandleCreated)
+            {
+                RemoveClipboardFormatListener(this.Handle);
+            }
+
             _renderTimer?.Dispose();
             _topmostTimer?.Dispose();
             _mousePollingTimer?.Stop();
@@ -487,6 +506,9 @@ namespace DynamicIsland
             _timeFont?.Dispose();
             _dateFont?.Dispose();
             _notificationFont?.Dispose();
+            _linkFont?.Dispose();
+            _buttonFont?.Dispose();
+            _promptFont?.Dispose();
             _stringFormat?.Dispose();
             _bufferGraphics?.Dispose();
             _bufferBitmap?.Dispose();
@@ -500,11 +522,215 @@ namespace DynamicIsland
             _contextMenu?.Dispose();
         }
 
-        // ==================== 硬件监控功能 ====================
+        private bool IsValidUrl(string text)
+        {
+            if (string.IsNullOrWhiteSpace(text) || text.Length > 2000)
+                return false;
 
-        /// <summary>
-        /// 检查互联网连接状态
-        /// </summary>
+            string[] schemes = { "http://", "https://", "ftp://", "file://" };
+            bool hasScheme = schemes.Any(s => text.StartsWith(s, StringComparison.OrdinalIgnoreCase));
+
+            if (!hasScheme)
+            {
+                if (!text.Contains(".") || text.Contains(" "))
+                    return false;
+
+                string[] nonUrlPatterns = { "\n", "\r", "\\", ";", "|", "<", ">", "\"", "'" };
+                if (nonUrlPatterns.Any(p => text.Contains(p)))
+                    return false;
+
+                var domainRegex = new Regex(@"^[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?(\.[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?)*$", RegexOptions.IgnoreCase);
+                string domainPart = text.Split('/')[0].Split(':')[0];
+                if (!domainRegex.IsMatch(domainPart))
+                    return false;
+
+                return true;
+            }
+
+            try
+            {
+                Uri uri = new Uri(text);
+                return uri.Scheme == Uri.UriSchemeHttp ||
+                       uri.Scheme == Uri.UriSchemeHttps ||
+                       uri.Scheme == Uri.UriSchemeFtp ||
+                       uri.Scheme == Uri.UriSchemeFile;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private string FormatLinkForDisplay(string link, int maxLength = 40)
+        {
+            if (string.IsNullOrEmpty(link))
+                return "";
+
+            string display = link;
+            if (display.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                display = display.Substring(8);
+            else if (display.StartsWith("http://", StringComparison.OrdinalIgnoreCase))
+                display = display.Substring(7);
+            else if (display.StartsWith("ftp://", StringComparison.OrdinalIgnoreCase))
+                display = display.Substring(6);
+
+            if (display.Length > maxLength)
+                display = display.Substring(0, maxLength - 3) + "...";
+
+            return display;
+        }
+
+        private void ProcessClipboardLink(string link)
+        {
+            if (_isLinkDialogActive)
+                return;
+
+            if (link == _lastClipboardText &&
+                (DateTime.Now - _lastClipboardCheck) < _clipboardDebounce)
+                return;
+
+            _lastClipboardText = link;
+            _lastClipboardCheck = DateTime.Now;
+            _pendingLink = link;
+
+            this.BeginInvoke(new Action(() =>
+            {
+                ShowLinkConfirmationDialog(link);
+            }));
+        }
+
+        private void ShowLinkConfirmationDialog(string link)
+        {
+            _isLinkDialogActive = true;
+            _isAutoPopupActive = true;
+
+            SetClickableMode(true);
+
+            SetExpanded(true);
+            // 使用默认放大大小
+            _targetWidth = ExpandedWidth;
+            _targetHeight = ExpandedHeight;
+
+            var linkItem = new ContentItem
+            {
+                Text = "检测到链接，是否打开？",  // 第一行：提示文字
+                SubText = FormatLinkForDisplay(link),  // 第二行：链接
+                Font = _promptFont,  // 稍大的字体，加粗
+                SubFont = _linkFont,
+                Color = Color.White,  // 白色
+                SubColor = Color.FromArgb(200, 200, 200),  // 白色偏灰
+                TargetScale = 1.0f,
+                CurrentScale = 0.5f,
+                CurrentAlpha = 0f,
+                IsActive = true,
+                Duration = TimeSpan.FromSeconds(5),  // 5秒自动关闭
+                IsClickable = true,
+                OnConfirm = () =>
+                {
+                    OpenLink(link);
+                    CloseLinkDialog();
+                }
+            };
+
+            TransitionToContent(linkItem);
+
+            _autoPopupTimer?.Stop();
+            _autoPopupTimer?.Dispose();
+            _autoPopupTimer = new System.Windows.Forms.Timer { Interval = 5000 };  // 5秒
+            _autoPopupTimer.Tick += (s, e) =>
+            {
+                // 检查鼠标是否在窗口内，如果在则不关闭
+                if (!_mouseInside)
+                {
+                    CloseLinkDialog();
+                }
+            };
+            _autoPopupTimer.Start();
+        }
+
+        private void OpenLink(string link)
+        {
+            try
+            {
+                string url = link;
+                if (!url.StartsWith("http://", StringComparison.OrdinalIgnoreCase) &&
+                    !url.StartsWith("https://", StringComparison.OrdinalIgnoreCase) &&
+                    !url.StartsWith("ftp://", StringComparison.OrdinalIgnoreCase) &&
+                    !url.StartsWith("file://", StringComparison.OrdinalIgnoreCase))
+                {
+                    url = "https://" + url;
+                }
+
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = url,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                ShowNotification($"无法打开链接: {ex.Message}", TimeSpan.FromSeconds(3));
+            }
+        }
+
+        private void CloseLinkDialog()
+        {
+            if (!_isLinkDialogActive)
+                return;
+
+            _isLinkDialogActive = false;
+            _pendingLink = null;
+
+            _autoPopupTimer?.Stop();
+            _autoPopupTimer?.Dispose();
+            _autoPopupTimer = null;
+
+            SetClickableMode(false);
+
+            SetExpanded(false);
+
+            var timeItem = new ContentItem
+            {
+                Text = DateTime.Now.ToString("HH:mm:ss"),
+                Font = _timeFont,
+                Color = Color.White,
+                TargetScale = 1.0f,
+                CurrentScale = 0.8f,
+                CurrentAlpha = 0f,
+                IsActive = true,
+                Duration = TimeSpan.Zero
+            };
+
+            TransitionToContent(timeItem);
+            _isAutoPopupActive = false;
+        }
+
+        private void SetClickableMode(bool clickable)
+        {
+            if (_isClickableMode == clickable)
+                return;
+
+            _isClickableMode = clickable;
+
+            if (this.IsDisposed || !this.IsHandleCreated)
+                return;
+
+            int exStyle = GetWindowLong(this.Handle, GWL_EXSTYLE);
+
+            if (clickable)
+            {
+                exStyle &= ~WS_EX_TRANSPARENT;
+            }
+            else
+            {
+                exStyle |= WS_EX_TRANSPARENT;
+            }
+
+            SetWindowLong(this.Handle, GWL_EXSTYLE, exStyle);
+            SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        }
+
         private bool CheckInternetConnection()
         {
             try
@@ -521,9 +747,6 @@ namespace DynamicIsland
             }
         }
 
-        /// <summary>
-        /// 获取当前WiFi SSID
-        /// </summary>
         private string GetWifiSSID()
         {
             try
@@ -544,7 +767,6 @@ namespace DynamicIsland
                 string output = process.StandardOutput.ReadToEnd();
                 process.WaitForExit();
 
-                // 解析SSID
                 var match = Regex.Match(output, @"SSID\s*:\s*(.+?)\r?\n");
                 if (match.Success)
                 {
@@ -558,15 +780,11 @@ namespace DynamicIsland
             }
         }
 
-        /// <summary>
-        /// 获取已连接的蓝牙设备
-        /// </summary>
         private HashSet<string> GetBluetoothDevices()
         {
             var devices = new HashSet<string>();
             try
             {
-                // 使用WMI查询蓝牙设备
                 using (var searcher = new ManagementObjectSearcher(
                     "SELECT * FROM Win32_PnPEntity WHERE ClassGuid='{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}'"))
                 {
@@ -577,7 +795,6 @@ namespace DynamicIsland
 
                         if (status == "OK" && !string.IsNullOrEmpty(name))
                         {
-                            // 排除蓝牙适配器本身
                             string[] excludeKeywords = { "Enumerator", "枚举器", "Adapter", "适配器", "Radio", "无线电" };
                             if (!excludeKeywords.Any(k => name.Contains(k)))
                             {
@@ -587,7 +804,6 @@ namespace DynamicIsland
                     }
                 }
 
-                // 备用方案：使用PowerShell获取更详细的蓝牙信息
                 if (devices.Count == 0)
                 {
                     try
@@ -629,31 +845,24 @@ namespace DynamicIsland
             return devices;
         }
 
-        /// <summary>
-        /// 硬件监控主循环
-        /// </summary>
         private void HardwareMonitorLoop(object state)
         {
             try
             {
-                // 网络检测
                 bool isOnline = CheckInternetConnection();
                 string currentSSID = GetWifiSSID();
 
                 lock (_hardwareLock)
                 {
-                    // 网络状态变化检测
                     if (isOnline)
                     {
                         if (!_wasOnline)
                         {
-                            // 从离线变为在线
                             string msg = !string.IsNullOrEmpty(currentSSID) ? $"{currentSSID}" : "网络已连接";
                             ShowNotification(msg, TimeSpan.FromSeconds(3));
                         }
                         else if (!string.IsNullOrEmpty(currentSSID) && currentSSID != _lastSSID)
                         {
-                            // WiFi切换
                             ShowNotification($"{currentSSID}", TimeSpan.FromSeconds(3));
                         }
                     }
@@ -661,7 +870,6 @@ namespace DynamicIsland
                     _wasOnline = isOnline;
                     _lastSSID = currentSSID;
 
-                    // 蓝牙检测
                     var currentBTDevices = GetBluetoothDevices();
                     var newDevices = currentBTDevices.Except(_lastBluetoothDevices).ToList();
 
@@ -675,8 +883,6 @@ namespace DynamicIsland
             }
             catch { }
         }
-
-        // ==================== 窗口生命周期 ====================
 
         private void Form1_Load(object sender, EventArgs e)
         {
@@ -716,13 +922,21 @@ namespace DynamicIsland
 
             _topmostTimer = new System.Threading.Timer(EnsureSuperTopMost, null, 0, 100);
 
-            // 初始化硬件监控
             _wasOnline = CheckInternetConnection();
             _lastSSID = GetWifiSSID();
             _lastBluetoothDevices = GetBluetoothDevices();
 
-            // 每4秒检查一次硬件状态
             _hardwareMonitorTimer = new System.Threading.Timer(HardwareMonitorLoop, null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(4));
+
+            AddClipboardFormatListener(this.Handle);
+            try
+            {
+                if (Clipboard.ContainsText())
+                {
+                    _lastClipboardText = Clipboard.GetText();
+                }
+            }
+            catch { }
 
             ShowStartupNotification();
             RequestRender();
@@ -872,7 +1086,8 @@ namespace DynamicIsland
 
         private void MousePollingTimer_Tick(object sender, EventArgs e)
         {
-            if (_isAutoPopupActive) return;
+            // 链接弹窗模式下不自动关闭，但其他自动弹窗仍需要检查
+            if (_isAutoPopupActive && !_isLinkDialogActive) return;
 
             if (GetCursorPos(out POINT pt))
             {
@@ -884,7 +1099,11 @@ namespace DynamicIsland
                 if (inside != _mouseInside)
                 {
                     _mouseInside = inside;
-                    SetExpanded(inside);
+                    // 链接弹窗模式下不随鼠标移出而关闭
+                    if (!_isLinkDialogActive)
+                    {
+                        SetExpanded(inside);
+                    }
                 }
             }
         }
@@ -909,13 +1128,40 @@ namespace DynamicIsland
                 TrackMouseEvent(ref tme);
                 _mouseTracking = true;
             }
+
+            if (_isLinkDialogActive)
+            {
+                RequestRender();
+            }
         }
 
         private void Form1_MouseLeave(object sender, EventArgs e)
         {
             _mouseTracking = false;
             _mouseInside = false;
-            SetExpanded(false);
+            // 链接弹窗模式下鼠标移出不关闭
+            if (!_isLinkDialogActive)
+            {
+                SetExpanded(false);
+            }
+        }
+
+        private void Form1_MouseDown(object sender, MouseEventArgs e)
+        {
+            if (!_isLinkDialogActive || e.Button != MouseButtons.Left)
+                return;
+
+            Point clientPoint = this.PointToClient(Cursor.Position);
+
+            // 只点击打开按钮
+            if (_confirmButtonRect.Contains(clientPoint.X, clientPoint.Y))
+            {
+                _currentContent?.OnConfirm?.Invoke();
+            }
+        }
+
+        private void Form1_MouseUp(object sender, MouseEventArgs e)
+        {
         }
 
         private void SetExpanded(bool expanded)
@@ -1072,7 +1318,7 @@ namespace DynamicIsland
 
             DrawContent(g, islandRect);
 
-            if ((_isExpanded || _isAnimating) && !_isAutoPopupActive && expandProgress > 0.3f)
+            if ((_isExpanded || _isAnimating) && !_isAutoPopupActive && expandProgress > 0.3f && !_isLinkDialogActive)
             {
                 int dateAlpha = (int)(255 * Math.Min(1f, (expandProgress - 0.3f) / 0.7f));
                 string dateStr = DateTime.Now.ToString("MM/dd");
@@ -1121,14 +1367,115 @@ namespace DynamicIsland
             matrix.Translate(-centerX, -centerY);
             g.Transform = matrix;
 
-            using (var brush = new SolidBrush(color))
+            if (_isLinkDialogActive && item.IsClickable)
             {
-                g.DrawString(item.Text, item.Font, brush,
-                    new RectangleF(islandRect.X, islandRect.Y + 2 * _dpiScale, islandRect.Width, islandRect.Height),
-                    _stringFormat);
+                DrawLinkDialogContent(g, islandRect, item, alpha);
+            }
+            else
+            {
+                using (var brush = new SolidBrush(color))
+                {
+                    g.DrawString(item.Text, item.Font, brush,
+                        new RectangleF(islandRect.X, islandRect.Y + 2 * _dpiScale, islandRect.Width, islandRect.Height),
+                        _stringFormat);
+                }
             }
 
             g.Restore(state);
+        }
+
+        private void DrawLinkDialogContent(Graphics g, RectangleF islandRect, ContentItem item, int alpha)
+        {
+            var whiteColor = Color.FromArgb(alpha, 255, 255, 255);
+            var linkColor = Color.FromArgb(alpha, item.SubColor.R, item.SubColor.G, item.SubColor.B);
+            var buttonColor = Color.FromArgb(alpha, 76, 175, 80);
+
+            // 第一行：提示文字（白色，稍大，靠左对齐）
+            using (var brush = new SolidBrush(whiteColor))
+            {
+                var leftFormat = new StringFormat
+                {
+                    Alignment = StringAlignment.Near,
+                    LineAlignment = StringAlignment.Center
+                };
+                float leftMargin = 15 * _dpiScale;
+                var promptRect = new RectangleF(islandRect.X + leftMargin, islandRect.Y + 8 * _dpiScale,
+                    islandRect.Width - leftMargin * 2, 22 * _dpiScale);
+                g.DrawString(item.Text, item.Font, brush, promptRect, leftFormat);
+            }
+
+            // 第二行：链接和按钮放在同一行
+            float row2Y = islandRect.Y + 35 * _dpiScale;
+            float buttonWidth = 55 * _dpiScale;
+            float buttonHeight = 24 * _dpiScale;
+            float spacing = 15 * _dpiScale;
+
+            // 计算链接文本区域（左侧）
+            string linkText = item.SubText;
+            SizeF linkSize = g.MeasureString(linkText, item.SubFont ?? _linkFont);
+            float availableWidth = islandRect.Width - buttonWidth - spacing * 3;
+
+            // 如果链接太长，截断
+            if (linkSize.Width > availableWidth)
+            {
+                int maxChars = linkText.Length;
+                while (maxChars > 0 && g.MeasureString(linkText.Substring(0, maxChars) + "...", item.SubFont ?? _linkFont).Width > availableWidth)
+                {
+                    maxChars--;
+                }
+                if (maxChars > 0)
+                    linkText = linkText.Substring(0, maxChars) + "...";
+            }
+
+            // 绘制链接（左侧，不可点击，白色偏灰）
+            float linkX = islandRect.X + spacing;
+            float linkWidth = Math.Min(linkSize.Width, availableWidth);
+
+            using (var brush = new SolidBrush(linkColor))
+            {
+                var format = new StringFormat
+                {
+                    Alignment = StringAlignment.Near,
+                    LineAlignment = StringAlignment.Center
+                };
+                var linkRect = new RectangleF(linkX, row2Y, linkWidth, buttonHeight);
+                g.DrawString(linkText, item.SubFont ?? _linkFont, brush, linkRect, format);
+            }
+
+            // 绘制"打开"按钮（右侧）
+            float buttonX = islandRect.Right - buttonWidth - spacing;
+            _confirmButtonRect = new RectangleF(buttonX, row2Y, buttonWidth, buttonHeight);
+            DrawButton(g, _confirmButtonRect, "打开", buttonColor, whiteColor, alpha);
+        }
+
+        private void DrawButton(Graphics g, RectangleF rect, string text, Color bgColor, Color textColor, int alpha)
+        {
+            Point mousePos = this.PointToClient(Cursor.Position);
+            bool isHovered = rect.Contains(mousePos.X, mousePos.Y);
+
+            if (isHovered)
+            {
+                bgColor = Color.FromArgb(alpha,
+                    Math.Min(255, bgColor.R + 30),
+                    Math.Min(255, bgColor.G + 30),
+                    Math.Min(255, bgColor.B + 30));
+            }
+
+            using (var brush = new SolidBrush(bgColor))
+            using (var path = GetRoundedRect(rect, 6 * _dpiScale))
+            {
+                g.FillPath(brush, path);
+            }
+
+            using (var brush = new SolidBrush(textColor))
+            {
+                var format = new StringFormat
+                {
+                    Alignment = StringAlignment.Center,
+                    LineAlignment = StringAlignment.Center
+                };
+                g.DrawString(text, _buttonFont, brush, rect, format);
+            }
         }
 
         private void DrawShadow(Graphics g, RectangleF islandRect, float radius, float shadowOpacity)
@@ -1241,10 +1588,8 @@ namespace DynamicIsland
 
         protected override void WndProc(ref Message m)
         {
-            // 检查是否是我们的自定义消息
             if (m.Msg == WM_SHOWINSTANCE_MESSAGE)
             {
-                // 收到新实例启动的消息，显示"已启动"通知
                 this.BeginInvoke(new Action(() =>
                 {
                     ShowNotification("请勿重复启动", TimeSpan.FromSeconds(2), customColor: Color.FromArgb(180, 229, 162));
@@ -1252,6 +1597,25 @@ namespace DynamicIsland
                 m.Result = IntPtr.Zero;
                 return;
             }
+
+            if (m.Msg == WM_CLIPBOARDUPDATE)
+            {
+                try
+                {
+                    if (Clipboard.ContainsText())
+                    {
+                        string text = Clipboard.GetText();
+                        if (IsValidUrl(text))
+                        {
+                            ProcessClipboardLink(text);
+                        }
+                    }
+                }
+                catch { }
+                m.Result = IntPtr.Zero;
+                return;
+            }
+
             base.WndProc(ref m);
         }
 
