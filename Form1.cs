@@ -1,4 +1,6 @@
-// Form1.cs - 修复搜索框输入问题
+// Form1.cs - 这个文件曾经由AI修改过，可能留下奇怪的注释，尤其是UI和音乐播放部分
+//反正不影响运行就行了
+
 
 using System.Collections.Generic;
 using System.Diagnostics;
