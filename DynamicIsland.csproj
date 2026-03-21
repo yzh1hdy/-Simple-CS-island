@@ -9,7 +9,20 @@
 	</PropertyGroup>
 
 	<ItemGroup>
-	  <PackageReference Include="System.Management" Version="10.0.5" />
+	  <COMReference Include="WMPLib">
+	    <WrapperTool>tlbimp</WrapperTool>
+	    <VersionMinor>0</VersionMinor>
+	    <VersionMajor>1</VersionMajor>
+	    <Guid>6bf52a50-394a-11d3-b153-00c04f79faa6</Guid>
+	    <Lcid>0</Lcid>
+	    <Isolated>false</Isolated>
+	    <EmbedInteropTypes>true</EmbedInteropTypes>
+	  </COMReference>
+	</ItemGroup>
+
+	<ItemGroup>
+	  <PackageReference Include="NAudio" Version="2.3.0" />
+	  <PackageReference Include="System.Management" Version="11.0.0-preview.2.26159.112" />
 	</ItemGroup>
 
 	<ItemGroup>

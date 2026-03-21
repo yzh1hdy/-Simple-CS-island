@@ -1,16 +1,21 @@
-// Form1.cs
+// Form1.cs - 修复搜索框输入问题
+
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
 using System.Linq;
 using System;
-using System.Management;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text.RegularExpressions;
 using System.Threading;
 using System.Windows.Forms;
+using System.IO;
+using System.Media;
+using WMPLib;
+using NAudio.Wave;
+using NAudio.Dsp;
 
 namespace DynamicIsland
 {
@@ -72,15 +77,63 @@ namespace DynamicIsland
     public class Form1 : Form
     {
         private const string MUTEX_NAME = "DynamicIsland_SingleInstance_Mutex_v1";
-        private const string WM_SHOWINSTANCE = "WM_DynamicIsland_ShowInstance";
+        private const string WM_SHOWINSTANCE = "WM_DynamicIsland_ShowInstance_v2";
         private static Mutex _mutex;
-        private static int WM_SHOWINSTANCE_MESSAGE;
+        private static uint WM_SHOWINSTANCE_MESSAGE = 0;
 
-        // Clipboard monitoring
         private const int WM_CLIPBOARDUPDATE = 0x031D;
         private string _lastClipboardText = "";
         private DateTime _lastClipboardCheck = DateTime.MinValue;
         private readonly TimeSpan _clipboardDebounce = TimeSpan.FromSeconds(2);
+
+        private bool _isMusicMode = false;
+        private bool _isMusicModeExpanded = true;
+        private string _musicModeState = "waiting";
+        private bool _isPlaying = false;
+        private string _currentFileName = "";
+        private TimeSpan _currentPosition = TimeSpan.Zero;
+        private TimeSpan _totalDuration = TimeSpan.FromMinutes(3);
+        private System.Windows.Forms.Timer _musicProgressTimer;
+        private RectangleF _playPauseButtonRect;
+        private RectangleF _progressBarRect;
+        private Font _largeTimeFont;
+        private Font _hintFont;
+        private Font _musicFileFont;
+        private Font _musicTimeFont;
+        private DateTime _musicModeStartTime;
+        private bool _altKeyPressed = false;
+
+        private bool _isSearchMode = false;
+        private string _searchText = "";
+        private RectangleF _searchBoxRect;
+        private RectangleF _searchIconRect;
+        private TextBox _hiddenTextBox;
+        private DateTime _lastSearchTime = DateTime.MinValue;
+        private readonly TimeSpan _searchDebounce = TimeSpan.FromMilliseconds(300);
+        private System.Windows.Forms.Timer _cursorTimer;
+        private bool _cursorVisible = true;
+        private int _cursorPosition = 0;
+
+        private WindowsMediaPlayer _mediaPlayer;
+        private string _currentAudioFilePath = "";
+
+        private WasapiLoopbackCapture _audioCapture;
+        private float[] _audioBars = new float[8] { 0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f };
+        private float[] _audioBarTargets = new float[8] { 0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f, 0.15f };
+        private System.Windows.Forms.Timer _audioVisualizerTimer;
+        private readonly object _audioDataLock = new object();
+        private bool _isCapturingAudio = false;
+        private DateTime _lastAudioDataTime = DateTime.MinValue;
+
+        private const int FFT_SIZE = 4096;
+        private float[] _fftBuffer;
+        private Complex[] _fftComplex;
+        private float[] _window;
+        private readonly Queue<float> _sampleQueue = new Queue<float>();
+
+        private readonly float[] _freqBands = new float[9] { 20, 60, 150, 400, 1000, 2500, 6000, 15000, 20000 };
+
+        private float _timeAnimationProgress = 0f;
 
         [DllImport("shcore.dll")]
         private static extern int SetProcessDpiAwareness(int awareness);
@@ -102,7 +155,6 @@ namespace DynamicIsland
                 }
                 catch { }
             }
-            WM_SHOWINSTANCE_MESSAGE = (int)RegisterWindowMessage(WM_SHOWINSTANCE);
         }
 
         [DllImport("user32.dll", ExactSpelling = true, SetLastError = true)]
@@ -165,7 +217,7 @@ namespace DynamicIsland
         [DllImport("user32.dll")]
         private static extern bool IsWindow(IntPtr hWnd);
 
-        [DllImport("user32.dll", SetLastError = true)]
+        [DllImport("user32.dll")]
         private static extern bool SetWindowPos(IntPtr hWnd, int hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
 
         [DllImport("user32.dll", CharSet = CharSet.Auto)]
@@ -193,6 +245,18 @@ namespace DynamicIsland
         [DllImport("user32.dll", SetLastError = true)]
         [return: MarshalAs(UnmanagedType.Bool)]
         private static extern bool RemoveClipboardFormatListener(IntPtr hwnd);
+
+        [DllImport("user32.dll")]
+        private static extern short GetAsyncKeyState(int vKey);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr SetFocus(IntPtr hWnd);
+
+        [DllImport("user32.dll")]
+        private static extern IntPtr GetFocus();
+
+        private const int VK_MENU = 0x12;
+        private const int VK_CONTROL = 0x11;
 
         private static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         private const int SW_SHOWNOACTIVATE = 4;
@@ -247,7 +311,6 @@ namespace DynamicIsland
             public Win32Point(int x, int y) { this.x = x; this.y = y; }
         }
 
-        // 窗口宽度改回400
         private const int BaseWindowWidth = 400;
         private const int BaseWindowHeight = 140;
         private const int BaseIslandWidth = 150;
@@ -291,7 +354,7 @@ namespace DynamicIsland
         private Font _notificationFont;
         private Font _linkFont;
         private Font _buttonFont;
-        private Font _promptFont;      // 提示文字字体（稍大）
+        private Font _promptFont;
         private StringFormat _stringFormat;
 
         private Bitmap _bufferBitmap;
@@ -333,11 +396,7 @@ namespace DynamicIsland
         {
             try
             {
-                if (WM_SHOWINSTANCE_MESSAGE == 0)
-                {
-                    WM_SHOWINSTANCE_MESSAGE = (int)RegisterWindowMessage(WM_SHOWINSTANCE);
-                }
-
+                uint msg = RegisterWindowMessage(WM_SHOWINSTANCE);
                 IntPtr hWnd = IntPtr.Zero;
                 hWnd = FindWindow(null, "Dynamic Island");
 
@@ -345,7 +404,6 @@ namespace DynamicIsland
                 {
                     Process currentProcess = Process.GetCurrentProcess();
                     Process[] processes = Process.GetProcessesByName(currentProcess.ProcessName);
-
                     foreach (Process process in processes)
                     {
                         if (process.Id != currentProcess.Id && process.MainWindowHandle != IntPtr.Zero)
@@ -362,8 +420,9 @@ namespace DynamicIsland
                     {
                         ShowWindow(hWnd, 4);
                     }
-                    SendMessage(hWnd, (uint)WM_SHOWINSTANCE_MESSAGE, IntPtr.Zero, IntPtr.Zero);
+                    IntPtr result = SendMessage(hWnd, msg, new IntPtr(1), IntPtr.Zero);
                     SetForegroundWindow(hWnd);
+                    BringWindowToTop(hWnd);
                 }
             }
             catch (Exception ex)
@@ -380,6 +439,17 @@ namespace DynamicIsland
             _targetWidth = IslandWidth;
             _targetHeight = IslandHeight;
             InitializeComponent();
+
+            _fftBuffer = new float[FFT_SIZE];
+            _fftComplex = new Complex[FFT_SIZE];
+            _window = new float[FFT_SIZE];
+
+            for (int i = 0; i < FFT_SIZE; i++)
+            {
+                _window[i] = 0.5f * (1 - (float)Math.Cos(2 * Math.PI * i / (FFT_SIZE - 1)));
+            }
+
+            WM_SHOWINSTANCE_MESSAGE = RegisterWindowMessage(WM_SHOWINSTANCE);
         }
 
         private float GetDpiScale()
@@ -409,6 +479,7 @@ namespace DynamicIsland
             this.Location = new Point((screen.Width - WindowWidth) / 2, 0);
             this.FormBorderStyle = FormBorderStyle.None;
             this.ShowInTaskbar = false;
+            this.AllowDrop = true;
             this.Load += Form1_Load;
 
             float timeFontSize = 17f * _dpiScale;
@@ -416,7 +487,11 @@ namespace DynamicIsland
             float notificationFontSize = 22f * _dpiScale;
             float linkFontSize = 12f * _dpiScale;
             float buttonFontSize = 13f * _dpiScale;
-            float promptFontSize = 15f * _dpiScale;  // 提示文字稍大
+            float promptFontSize = 15f * _dpiScale;
+            float largeTimeFontSize = 24f * _dpiScale;
+            float hintFontSize = 10f * _dpiScale;
+            float musicFileFontSize = 12f * _dpiScale;
+            float musicTimeFontSize = 11f * _dpiScale;
 
             _timeFont = new Font("Microsoft YaHei", timeFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
             _dateFont = new Font("Microsoft YaHei", dateFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
@@ -424,6 +499,11 @@ namespace DynamicIsland
             _linkFont = new Font("Microsoft YaHei", linkFontSize, FontStyle.Regular, GraphicsUnit.Pixel);
             _buttonFont = new Font("Microsoft YaHei", buttonFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
             _promptFont = new Font("Microsoft YaHei", promptFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
+
+            _largeTimeFont = new Font("Microsoft YaHei", largeTimeFontSize, FontStyle.Bold, GraphicsUnit.Pixel);
+            _hintFont = new Font("Microsoft YaHei", hintFontSize, FontStyle.Regular, GraphicsUnit.Pixel);
+            _musicFileFont = new Font("Microsoft YaHei", musicFileFontSize, FontStyle.Regular, GraphicsUnit.Pixel);
+            _musicTimeFont = new Font("Microsoft YaHei", musicTimeFontSize, FontStyle.Regular, GraphicsUnit.Pixel);
 
             _stringFormat = new StringFormat
             {
@@ -435,6 +515,94 @@ namespace DynamicIsland
             this.MouseLeave += Form1_MouseLeave;
             this.MouseDown += Form1_MouseDown;
             this.MouseUp += Form1_MouseUp;
+            this.DragEnter += Form1_DragEnter;
+            this.DragDrop += Form1_DragDrop;
+            this.KeyDown += Form1_KeyDown;
+            this.KeyPress += Form1_KeyPress;
+            this.KeyPreview = true;
+
+            InitializeHiddenTextBox();
+        }
+
+        private void InitializeHiddenTextBox()
+        {
+            _hiddenTextBox = new TextBox
+            {
+                Visible = false,
+                Width = 1,
+                Height = 1,
+                Location = new Point(-100, -100),
+                ImeMode = ImeMode.On,
+                BorderStyle = BorderStyle.None,
+                TabStop = false,
+                MaxLength = 100,
+                ShortcutsEnabled = true,
+                Multiline = false
+            };
+
+            _hiddenTextBox.TextChanged += (s, e) =>
+            {
+                if (_isSearchMode && _hiddenTextBox.Text != _searchText)
+                {
+                    _searchText = _hiddenTextBox.Text;
+                    _cursorPosition = _hiddenTextBox.SelectionStart;
+                    RequestRender();
+                }
+            };
+
+            _hiddenTextBox.KeyUp += (s, e) =>
+            {
+                if (_isSearchMode)
+                {
+                    _cursorPosition = _hiddenTextBox.SelectionStart;
+                    RequestRender();
+                }
+            };
+
+            _hiddenTextBox.KeyDown += (s, e) =>
+            {
+                if (!_isSearchMode) return;
+
+                if (e.KeyCode == Keys.Escape)
+                {
+                    e.SuppressKeyPress = true;
+                    ExitSearchMode();
+                    return;
+                }
+
+                if (e.KeyCode == Keys.Enter)
+                {
+                    e.SuppressKeyPress = true;
+                    DateTime now = DateTime.Now;
+                    if (now - _lastSearchTime < _searchDebounce)
+                    {
+                        return;
+                    }
+                    _lastSearchTime = now;
+                    PerformSearch();
+                    return;
+                }
+            };
+
+            _hiddenTextBox.GotFocus += (s, e) =>
+            {
+                if (!_isSearchMode)
+                {
+                    this.Focus();
+                }
+            };
+
+            this.Controls.Add(_hiddenTextBox);
+
+            _cursorTimer = new System.Windows.Forms.Timer { Interval = 530 };
+            _cursorTimer.Tick += (s, e) =>
+            {
+                if (_isSearchMode)
+                {
+                    _cursorVisible = !_cursorVisible;
+                    RequestRender();
+                }
+            };
         }
 
         private void InitializeTrayIcon()
@@ -467,18 +635,26 @@ namespace DynamicIsland
             if (_isExiting) return;
             _isExiting = true;
 
+            try
+            {
+                if (_notifyIcon != null)
+                {
+                    _notifyIcon.Visible = false;
+                }
+            }
+            catch { }
+
             this.BeginInvoke(new Action(() =>
             {
                 try
                 {
-                    if (_notifyIcon != null)
-                    {
-                        _notifyIcon.Visible = false;
-                    }
                     CleanupResources();
-                    Application.Exit();
                 }
                 catch (Exception ex)
+                {
+                    Debug.WriteLine($"Exit error: {ex.Message}");
+                }
+                finally
                 {
                     Environment.Exit(0);
                 }
@@ -489,8 +665,14 @@ namespace DynamicIsland
         {
             if (this.IsHandleCreated)
             {
-                RemoveClipboardFormatListener(this.Handle);
+                try
+                {
+                    RemoveClipboardFormatListener(this.Handle);
+                }
+                catch { }
             }
+
+            StopAudioCapture();
 
             _renderTimer?.Dispose();
             _topmostTimer?.Dispose();
@@ -499,6 +681,25 @@ namespace DynamicIsland
             _autoPopupTimer?.Stop();
             _autoPopupTimer?.Dispose();
             _hardwareMonitorTimer?.Dispose();
+            _musicProgressTimer?.Stop();
+            _musicProgressTimer?.Dispose();
+            _audioVisualizerTimer?.Stop();
+            _audioVisualizerTimer?.Dispose();
+
+            _cursorTimer?.Stop();
+            _cursorTimer?.Dispose();
+            _hiddenTextBox?.Dispose();
+
+            if (_mediaPlayer != null)
+            {
+                try
+                {
+                    _mediaPlayer.controls.stop();
+                    _mediaPlayer.close();
+                }
+                catch { }
+                _mediaPlayer = null;
+            }
 
             _currentContent = null;
             _nextContent = null;
@@ -509,6 +710,10 @@ namespace DynamicIsland
             _linkFont?.Dispose();
             _buttonFont?.Dispose();
             _promptFont?.Dispose();
+            _largeTimeFont?.Dispose();
+            _hintFont?.Dispose();
+            _musicFileFont?.Dispose();
+            _musicTimeFont?.Dispose();
             _stringFormat?.Dispose();
             _bufferGraphics?.Dispose();
             _bufferBitmap?.Dispose();
@@ -516,7 +721,11 @@ namespace DynamicIsland
 
             if (_notifyIcon != null)
             {
-                _notifyIcon.Dispose();
+                try
+                {
+                    _notifyIcon.Dispose();
+                }
+                catch { }
                 _notifyIcon = null;
             }
             _contextMenu?.Dispose();
@@ -582,7 +791,7 @@ namespace DynamicIsland
 
         private void ProcessClipboardLink(string link)
         {
-            if (_isLinkDialogActive)
+            if (_isLinkDialogActive || _isMusicMode || _isSearchMode)
                 return;
 
             if (link == _lastClipboardText &&
@@ -607,23 +816,22 @@ namespace DynamicIsland
             SetClickableMode(true);
 
             SetExpanded(true);
-            // 使用默认放大大小
             _targetWidth = ExpandedWidth;
             _targetHeight = ExpandedHeight;
 
             var linkItem = new ContentItem
             {
-                Text = "检测到链接，是否打开？",  // 第一行：提示文字
-                SubText = FormatLinkForDisplay(link),  // 第二行：链接
-                Font = _promptFont,  // 稍大的字体，加粗
+                Text = "检测到链接，是否打开？",
+                SubText = FormatLinkForDisplay(link),
+                Font = _promptFont,
                 SubFont = _linkFont,
-                Color = Color.White,  // 白色
-                SubColor = Color.FromArgb(200, 200, 200),  // 白色偏灰
+                Color = Color.White,
+                SubColor = Color.FromArgb(200, 200, 200),
                 TargetScale = 1.0f,
                 CurrentScale = 0.5f,
                 CurrentAlpha = 0f,
                 IsActive = true,
-                Duration = TimeSpan.FromSeconds(5),  // 5秒自动关闭
+                Duration = TimeSpan.FromSeconds(5),
                 IsClickable = true,
                 OnConfirm = () =>
                 {
@@ -636,10 +844,9 @@ namespace DynamicIsland
 
             _autoPopupTimer?.Stop();
             _autoPopupTimer?.Dispose();
-            _autoPopupTimer = new System.Windows.Forms.Timer { Interval = 5000 };  // 5秒
+            _autoPopupTimer = new System.Windows.Forms.Timer { Interval = 5000 };
             _autoPopupTimer.Tick += (s, e) =>
             {
-                // 检查鼠标是否在窗口内，如果在则不关闭
                 if (!_mouseInside)
                 {
                     CloseLinkDialog();
@@ -731,6 +938,473 @@ namespace DynamicIsland
                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
 
+        private void ToggleMusicMode()
+        {
+            if (_isMusicMode)
+            {
+                ExitMusicMode();
+            }
+            else
+            {
+                EnterMusicMode();
+            }
+        }
+
+        private void EnterMusicMode()
+        {
+            _isMusicMode = true;
+            _isMusicModeExpanded = true;
+            _musicModeState = "waiting";
+            _musicModeStartTime = DateTime.Now;
+            _currentFileName = "";
+            _currentPosition = TimeSpan.Zero;
+            _isPlaying = false;
+
+            for (int i = 0; i < 8; i++)
+            {
+                _audioBars[i] = 0.15f;
+                _audioBarTargets[i] = 0.15f;
+            }
+
+            SetClickableMode(true);
+            SetExpanded(true);
+
+            if (_musicProgressTimer == null)
+            {
+                _musicProgressTimer = new System.Windows.Forms.Timer { Interval = 1000 };
+                _musicProgressTimer.Tick += MusicProgressTimer_Tick;
+            }
+            _musicProgressTimer.Start();
+
+            if (_audioVisualizerTimer == null)
+            {
+                _audioVisualizerTimer = new System.Windows.Forms.Timer { Interval = 16 };
+                _audioVisualizerTimer.Tick += AudioVisualizerTimer_Tick;
+            }
+            _audioVisualizerTimer.Start();
+
+            RequestRender();
+        }
+
+        private void ExitMusicMode()
+        {
+            StopAudioCapture();
+
+            if (_mediaPlayer != null)
+            {
+                try
+                {
+                    _mediaPlayer.controls.stop();
+                    _mediaPlayer.close();
+                }
+                catch { }
+                _mediaPlayer = null;
+            }
+
+            _isMusicMode = false;
+            _isMusicModeExpanded = true;
+            _musicModeState = "waiting";
+            _isPlaying = false;
+            _currentAudioFilePath = "";
+            _musicProgressTimer?.Stop();
+            _audioVisualizerTimer?.Stop();
+            SetClickableMode(false);
+            SetExpanded(false);
+
+            var timeItem = new ContentItem
+            {
+                Text = DateTime.Now.ToString("HH:mm:ss"),
+                Font = _timeFont,
+                Color = Color.White,
+                TargetScale = 1.0f,
+                CurrentScale = 0.8f,
+                CurrentAlpha = 0f,
+                IsActive = true,
+                Duration = TimeSpan.Zero
+            };
+            TransitionToContent(timeItem);
+        }
+
+        private void MinimizeMusicMode()
+        {
+            _isMusicModeExpanded = false;
+            SetExpanded(false);
+            RequestRender();
+        }
+
+        private void ExpandMusicMode()
+        {
+            _isMusicModeExpanded = true;
+            SetExpanded(true);
+            RequestRender();
+        }
+
+        private void StartAudioCapture()
+        {
+            if (_isCapturingAudio) return;
+
+            try
+            {
+                lock (_sampleQueue)
+                {
+                    _sampleQueue.Clear();
+                }
+
+                _audioCapture = new WasapiLoopbackCapture();
+                _audioCapture.DataAvailable += AudioCapture_DataAvailable;
+                _audioCapture.RecordingStopped += (sender, e) => { _isCapturingAudio = false; };
+
+                _audioCapture.StartRecording();
+                _isCapturingAudio = true;
+                _lastAudioDataTime = DateTime.Now;
+            }
+            catch
+            {
+                _isCapturingAudio = false;
+            }
+        }
+
+        private void AudioCapture_DataAvailable(object sender, WaveInEventArgs e)
+        {
+            try
+            {
+                _lastAudioDataTime = DateTime.Now;
+
+                if (e.BytesRecorded <= 0) return;
+
+                int bytesPerSample = 4;
+
+                for (int i = 0; i < e.BytesRecorded; i += bytesPerSample * 2)
+                {
+                    if (i + bytesPerSample * 2 <= e.BytesRecorded)
+                    {
+                        float left = BitConverter.ToSingle(e.Buffer, i);
+                        float right = BitConverter.ToSingle(e.Buffer, i + bytesPerSample);
+                        float sample = (left + right) * 0.5f;
+
+                        lock (_sampleQueue)
+                        {
+                            _sampleQueue.Enqueue(sample);
+                            if (_sampleQueue.Count > FFT_SIZE * 4)
+                            {
+                                while (_sampleQueue.Count > FFT_SIZE)
+                                    _sampleQueue.Dequeue();
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+        }
+
+        private void StopAudioCapture()
+        {
+            if (!_isCapturingAudio) return;
+
+            try
+            {
+                _audioCapture?.StopRecording();
+                _audioCapture?.Dispose();
+                _audioCapture = null;
+                _isCapturingAudio = false;
+
+                lock (_audioDataLock)
+                {
+                    for (int i = 0; i < 8; i++)
+                    {
+                        _audioBarTargets[i] = 0.15f;
+                    }
+                }
+
+                lock (_sampleQueue)
+                {
+                    _sampleQueue.Clear();
+                }
+            }
+            catch { }
+        }
+
+        private void MusicProgressTimer_Tick(object sender, EventArgs e)
+        {
+            if (_isPlaying && _musicModeState == "playing" && _mediaPlayer != null)
+            {
+                try
+                {
+                    _currentPosition = TimeSpan.FromSeconds(_mediaPlayer.controls.currentPosition);
+                    double totalSeconds = _mediaPlayer.currentMedia.duration;
+
+                    if (_currentPosition.TotalSeconds >= totalSeconds - 0.5 && totalSeconds > 0)
+                    {
+                        _mediaPlayer.controls.currentPosition = 0;
+                        _currentPosition = TimeSpan.Zero;
+                        _mediaPlayer.controls.play();
+                    }
+
+                    RequestRender();
+                }
+                catch
+                {
+                }
+            }
+        }
+
+        private void AudioVisualizerTimer_Tick(object sender, EventArgs e)
+        {
+            if (!_isMusicMode) return;
+
+            float[] samples = null;
+            lock (_sampleQueue)
+            {
+                if (_sampleQueue.Count >= FFT_SIZE)
+                {
+                    samples = new float[FFT_SIZE];
+                    for (int i = 0; i < FFT_SIZE; i++)
+                    {
+                        samples[i] = _sampleQueue.Dequeue();
+                    }
+                }
+            }
+
+            if (samples != null)
+            {
+                float[] bandEnergies = PerformFFTAndGetBandEnergies(samples);
+
+                lock (_audioDataLock)
+                {
+                    for (int i = 0; i < 8; i++)
+                    {
+                        _audioBarTargets[i] = bandEnergies[i];
+                    }
+                }
+            }
+            else
+            {
+                lock (_audioDataLock)
+                {
+                    for (int i = 0; i < 8; i++)
+                    {
+                        _audioBarTargets[i] = 0.15f;
+                    }
+                }
+            }
+
+            for (int i = 0; i < 8; i++)
+            {
+                float diff = _audioBarTargets[i] - _audioBars[i];
+                float smoothing = 0.35f;
+                _audioBars[i] += diff * smoothing;
+                _audioBars[i] = Math.Max(0.15f, Math.Min(1.0f, _audioBars[i]));
+            }
+
+            RequestRender();
+        }
+
+        private float[] PerformFFTAndGetBandEnergies(float[] samples)
+        {
+            float[] bandEnergies = new float[8];
+
+            try
+            {
+                for (int i = 0; i < FFT_SIZE; i++)
+                {
+                    _fftComplex[i].X = samples[i] * _window[i];
+                    _fftComplex[i].Y = 0;
+                }
+
+                int log2n = (int)Math.Log(FFT_SIZE, 2);
+                FastFourierTransform.FFT(true, log2n, _fftComplex);
+
+                float sampleRate = 44100f;
+                float freqResolution = sampleRate / FFT_SIZE;
+
+                int[] bandBinStart = new int[8];
+                int[] bandBinEnd = new int[8];
+
+                for (int band = 0; band < 8; band++)
+                {
+                    bandBinStart[band] = Math.Max(2, (int)(_freqBands[band] / freqResolution));
+                    bandBinEnd[band] = Math.Min(FFT_SIZE / 2, (int)(_freqBands[band + 1] / freqResolution));
+                    if (bandBinEnd[band] <= bandBinStart[band])
+                        bandBinEnd[band] = bandBinStart[band] + 1;
+                }
+
+                for (int band = 0; band < 8; band++)
+                {
+                    float maxMagnitude = 0;
+                    float sumMagnitude = 0;
+                    int count = 0;
+
+                    for (int i = bandBinStart[band]; i < bandBinEnd[band] && i < FFT_SIZE / 2; i++)
+                    {
+                        float real = _fftComplex[i].X;
+                        float imag = _fftComplex[i].Y;
+                        float magnitude = (float)Math.Sqrt(real * real + imag * imag);
+
+                        if (magnitude > maxMagnitude)
+                            maxMagnitude = magnitude;
+
+                        sumMagnitude += magnitude;
+                        count++;
+                    }
+
+                    float avgMagnitude = count > 0 ? sumMagnitude / count : 0;
+                    float combinedMagnitude = maxMagnitude * 0.7f + avgMagnitude * 0.3f;
+
+                    float[] dbRanges = { -50, -45, -40, -35, -35, -40, -45, -50 };
+
+                    float db = 20 * (float)Math.Log10(combinedMagnitude + 1e-10f);
+                    float normalized = (db - dbRanges[band]) / (0 - dbRanges[band]);
+
+                    normalized = (float)Math.Pow(normalized, 0.7);
+                    normalized = Math.Max(0.15f, Math.Min(1.0f, normalized));
+
+                    bandEnergies[band] = normalized;
+                }
+            }
+            catch
+            {
+                for (int i = 0; i < 8; i++)
+                    bandEnergies[i] = 0.15f;
+            }
+
+            return bandEnergies;
+        }
+
+        private void TogglePlayPause()
+        {
+            if (_musicModeState == "waiting" || _mediaPlayer == null) return;
+
+            if (_isPlaying)
+            {
+                _mediaPlayer.controls.pause();
+                _isPlaying = false;
+                _musicModeState = "paused";
+                StopAudioCapture();
+            }
+            else
+            {
+                _mediaPlayer.controls.play();
+                _isPlaying = true;
+                _musicModeState = "playing";
+                StartAudioCapture();
+            }
+            RequestRender();
+        }
+
+        private void Form1_DragEnter(object sender, DragEventArgs e)
+        {
+            if (!_isMusicMode) return;
+
+            if (e.Data.GetDataPresent(DataFormats.FileDrop))
+            {
+                string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+                string[] audioExtensions = { ".mp3", ".wav", ".wma", ".m4a", ".flac", ".aac", ".ogg" };
+
+                if (files.Any(f => audioExtensions.Contains(Path.GetExtension(f).ToLower())))
+                {
+                    e.Effect = DragDropEffects.Copy;
+                }
+            }
+        }
+
+        private void Form1_DragDrop(object sender, DragEventArgs e)
+        {
+            if (!_isMusicMode) return;
+
+            string[] files = (string[])e.Data.GetData(DataFormats.FileDrop);
+            string[] audioExtensions = { ".mp3", ".wav", ".wma", ".m4a", ".flac", ".aac", ".ogg" };
+
+            var audioFile = files.FirstOrDefault(f => audioExtensions.Contains(Path.GetExtension(f).ToLower()));
+            if (audioFile != null)
+            {
+                LoadAudioFile(audioFile);
+            }
+        }
+
+        private void LoadAudioFile(string filePath)
+        {
+            try
+            {
+                if (_mediaPlayer != null)
+                {
+                    try
+                    {
+                        _mediaPlayer.controls.stop();
+                        _mediaPlayer.close();
+                    }
+                    catch { }
+                }
+
+                StopAudioCapture();
+
+                _mediaPlayer = new WindowsMediaPlayer();
+                _mediaPlayer.URL = filePath;
+                _mediaPlayer.settings.autoStart = false;
+
+                _currentFileName = Path.GetFileNameWithoutExtension(filePath);
+                _currentAudioFilePath = filePath;
+
+                RequestRender();
+
+                _mediaPlayer.OpenStateChange += (state) =>
+                {
+                    if (state == 13)
+                    {
+                        this.BeginInvoke(new Action(() =>
+                        {
+                            try
+                            {
+                                if (_mediaPlayer != null && _mediaPlayer.currentMedia != null)
+                                {
+                                    double duration = _mediaPlayer.currentMedia.duration;
+                                    if (duration > 0)
+                                    {
+                                        _totalDuration = TimeSpan.FromSeconds(duration);
+                                    }
+                                    else
+                                    {
+                                        _totalDuration = TimeSpan.FromMinutes(3);
+                                    }
+                                    _currentPosition = TimeSpan.Zero;
+                                    _musicModeState = "playing";
+                                    _isPlaying = true;
+                                    _mediaPlayer.controls.play();
+
+                                    StartAudioCapture();
+
+                                    RequestRender();
+                                }
+                            }
+                            catch { }
+                        }));
+                    }
+                };
+
+                _mediaPlayer.MediaError += (item) =>
+                {
+                    this.BeginInvoke(new Action(() =>
+                    {
+                        ShowNotification("音频文件加载失败", TimeSpan.FromSeconds(3));
+                        _musicModeState = "waiting";
+                        _isPlaying = false;
+                        RequestRender();
+                    }));
+                };
+            }
+            catch (Exception ex)
+            {
+                ShowNotification($"加载音频失败: {ex.Message}", TimeSpan.FromSeconds(3));
+                _musicModeState = "waiting";
+                _isPlaying = false;
+            }
+        }
+
+        private string TruncateFileName(string fileName, int maxLength)
+        {
+            if (fileName.Length <= maxLength) return fileName;
+            return fileName.Substring(0, maxLength - 3) + "...";
+        }
+
         private bool CheckInternetConnection()
         {
             try
@@ -785,60 +1459,30 @@ namespace DynamicIsland
             var devices = new HashSet<string>();
             try
             {
-                using (var searcher = new ManagementObjectSearcher(
-                    "SELECT * FROM Win32_PnPEntity WHERE ClassGuid='{e0cbf06c-cd8b-4647-bb8a-263b43f0f974}'"))
+                var psProcess = new Process
                 {
-                    foreach (ManagementObject obj in searcher.Get())
+                    StartInfo = new ProcessStartInfo
                     {
-                        string status = obj["Status"]?.ToString();
-                        string name = obj["Name"]?.ToString();
-
-                        if (status == "OK" && !string.IsNullOrEmpty(name))
-                        {
-                            string[] excludeKeywords = { "Enumerator", "枚举器", "Adapter", "适配器", "Radio", "无线电" };
-                            if (!excludeKeywords.Any(k => name.Contains(k)))
-                            {
-                                devices.Add(name);
-                            }
-                        }
+                        FileName = "powershell",
+                        Arguments = "-Command \"Get-PnpDevice -Class Bluetooth | Where-Object {$_.Status -eq 'OK' -and $_.FriendlyName -notmatch 'Enumerator|Adapter|Radio'} | Select-Object -ExpandProperty FriendlyName\"",
+                        RedirectStandardOutput = true,
+                        UseShellExecute = false,
+                        CreateNoWindow = true,
+                        StandardOutputEncoding = System.Text.Encoding.UTF8
                     }
-                }
+                };
+                psProcess.Start();
+                string output = psProcess.StandardOutput.ReadToEnd();
+                psProcess.WaitForExit();
 
-                if (devices.Count == 0)
+                var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
+                foreach (var line in lines)
                 {
-                    try
+                    string name = line.Trim();
+                    if (!string.IsNullOrEmpty(name))
                     {
-                        var psProcess = new Process
-                        {
-                            StartInfo = new ProcessStartInfo
-                            {
-                                FileName = "powershell",
-                                Arguments = "-Command \"Get-PnpDevice -Class Bluetooth | Where-Object {$_.Status -eq 'OK'} | Select-Object -ExpandProperty FriendlyName\"",
-                                RedirectStandardOutput = true,
-                                UseShellExecute = false,
-                                CreateNoWindow = true,
-                                StandardOutputEncoding = System.Text.Encoding.UTF8
-                            }
-                        };
-                        psProcess.Start();
-                        string output = psProcess.StandardOutput.ReadToEnd();
-                        psProcess.WaitForExit();
-
-                        var lines = output.Split(new[] { '\r', '\n' }, StringSplitOptions.RemoveEmptyEntries);
-                        foreach (var line in lines)
-                        {
-                            string name = line.Trim();
-                            if (!string.IsNullOrEmpty(name))
-                            {
-                                string[] excludeKeywords = { "Enumerator", "枚举器", "Adapter", "适配器", "Radio", "无线电" };
-                                if (!excludeKeywords.Any(k => name.Contains(k)))
-                                {
-                                    devices.Add(name);
-                                }
-                            }
-                        }
+                        devices.Add(name);
                     }
-                    catch { }
                 }
             }
             catch { }
@@ -918,7 +1562,7 @@ namespace DynamicIsland
             _mousePollingTimer.Start();
 
             _lastTickTime = DateTime.UtcNow.Ticks;
-            _renderTimer = new System.Threading.Timer(RenderTick, null, 0, 8);
+            _renderTimer = new System.Threading.Timer(state => RenderTick(state), null, 0, 8);
 
             _topmostTimer = new System.Threading.Timer(EnsureSuperTopMost, null, 0, 100);
 
@@ -1022,6 +1666,8 @@ namespace DynamicIsland
                 return;
             }
 
+            if (_isMusicMode || _isSearchMode) return;
+
             _isAutoPopupActive = true;
             SetExpanded(true);
 
@@ -1086,26 +1732,214 @@ namespace DynamicIsland
 
         private void MousePollingTimer_Tick(object sender, EventArgs e)
         {
-            // 链接弹窗模式下不自动关闭，但其他自动弹窗仍需要检查
-            if (_isAutoPopupActive && !_isLinkDialogActive) return;
+            bool altPressed = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+            bool ctrlPressed = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
 
-            if (GetCursorPos(out POINT pt))
+            if (_isSearchMode)
+            {
+                if (ctrlPressed && !_altKeyPressed)
+                {
+                    ExitSearchMode();
+                    _altKeyPressed = true;
+                    return;
+                }
+
+                _altKeyPressed = ctrlPressed;
+                return;
+            }
+
+            if (_isMusicMode)
+            {
+                if (GetCursorPos(out POINT pt))
+                {
+                    var islandScreenRect = GetIslandScreenRect();
+                    float hitPadding = 8 * _dpiScale;
+                    var hitRect = new RectangleF(islandScreenRect.X - hitPadding, islandScreenRect.Y - hitPadding,
+                        islandScreenRect.Width + hitPadding * 2, islandScreenRect.Height + hitPadding * 2);
+                    bool inside = hitRect.Contains(pt.X, pt.Y);
+
+                    if (inside && !_isMusicModeExpanded && !_mouseInside)
+                    {
+                        ExpandMusicMode();
+                    }
+                    else if (!inside && _isMusicModeExpanded && _mouseInside)
+                    {
+                        MinimizeMusicMode();
+                    }
+
+                    _mouseInside = inside;
+                }
+
+                if (altPressed && !_altKeyPressed && _mouseInside)
+                {
+                    _altKeyPressed = true;
+                    ExitMusicMode();
+                    return;
+                }
+                else if (!altPressed)
+                {
+                    _altKeyPressed = false;
+                }
+                return;
+            }
+
+            if (_isLinkDialogActive)
+            {
+                if (GetCursorPos(out POINT pt))
+                {
+                    var islandScreenRect = GetIslandScreenRect();
+                    float hitPadding = 8 * _dpiScale;
+                    var hitRect = new RectangleF(islandScreenRect.X - hitPadding, islandScreenRect.Y - hitPadding,
+                        islandScreenRect.Width + hitPadding * 2, islandScreenRect.Height + hitPadding * 2);
+                    bool inside = hitRect.Contains(pt.X, pt.Y);
+
+                    if (!inside && _mouseInside)
+                    {
+                        CloseLinkDialog();
+                        return;
+                    }
+                    _mouseInside = inside;
+                }
+                return;
+            }
+
+            if (altPressed && !_altKeyPressed && _isExpanded && !_isMusicMode && !_isLinkDialogActive && !_isAutoPopupActive)
+            {
+                _altKeyPressed = true;
+                ToggleMusicMode();
+                return;
+            }
+
+            if (ctrlPressed && !_altKeyPressed && _isExpanded && !_isMusicMode && !_isLinkDialogActive && !_isAutoPopupActive)
+            {
+                _altKeyPressed = true;
+                EnterSearchMode();
+                return;
+            }
+
+            if (!altPressed && !ctrlPressed)
+            {
+                _altKeyPressed = false;
+            }
+
+            if (_isAutoPopupActive) return;
+
+            if (GetCursorPos(out POINT pt2))
             {
                 var islandScreenRect = GetIslandScreenRect();
                 float hitPadding = 8 * _dpiScale;
                 var hitRect = new RectangleF(islandScreenRect.X - hitPadding, islandScreenRect.Y - hitPadding,
                     islandScreenRect.Width + hitPadding * 2, islandScreenRect.Height + hitPadding * 2);
-                bool inside = hitRect.Contains(pt.X, pt.Y);
+                bool inside = hitRect.Contains(pt2.X, pt2.Y);
                 if (inside != _mouseInside)
                 {
                     _mouseInside = inside;
-                    // 链接弹窗模式下不随鼠标移出而关闭
-                    if (!_isLinkDialogActive)
-                    {
-                        SetExpanded(inside);
-                    }
+                    SetExpanded(inside);
                 }
             }
+        }
+
+        // ========== 修复：EnterSearchMode 方法 - 关键修复 ==========
+        private void EnterSearchMode()
+        {
+            _isSearchMode = true;
+            _searchText = "";
+            _cursorPosition = 0;
+            _cursorVisible = true;
+
+            // 关键修复1：先设置窗口样式，移除 NOACTIVATE 和 TRANSPARENT
+            if (this.IsHandleCreated && !this.IsDisposed)
+            {
+                int exStyle = GetWindowLong(this.Handle, GWL_EXSTYLE);
+                // 移除 NOACTIVATE 和 TRANSPARENT，保留 LAYERED
+                int newStyle = (exStyle & ~WS_EX_NOACTIVATE & ~WS_EX_TRANSPARENT) | WS_EX_LAYERED;
+                SetWindowLong(this.Handle, GWL_EXSTYLE, newStyle);
+                // 强制刷新窗口样式
+                SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
+
+            // 关键修复2：将窗口带到前台（但不激活）
+            SetForegroundWindow(this.Handle);
+
+            // 关键修复3：延迟激活隐藏文本框，确保样式已应用
+            this.BeginInvoke(new Action(() =>
+            {
+                if (_hiddenTextBox != null)
+                {
+                    _hiddenTextBox.Text = "";
+                    _hiddenTextBox.SelectionStart = 0;
+
+                    // 关键：让隐藏文本框获得焦点
+                    _hiddenTextBox.Focus();
+
+                    // 关键：选中文本以激活输入法（即使为空也要Select）
+                    _hiddenTextBox.Select(0, 0);
+
+                    // 强制启用输入法
+                    _hiddenTextBox.ImeMode = ImeMode.On;
+                }
+            }));
+
+            _cursorTimer?.Start();
+            SetClickableMode(true);
+            SetExpanded(true);
+            RequestRender();
+        }
+
+        // ========== 修复：ExitSearchMode 方法 ==========
+        private void ExitSearchMode()
+        {
+            _isSearchMode = false;
+            _searchText = "";
+            _cursorPosition = 0;
+
+            _cursorTimer?.Stop();
+
+            if (_hiddenTextBox != null)
+            {
+                _hiddenTextBox.Text = "";
+                // 将焦点返回给主窗体
+                this.Focus();
+            }
+
+            // 恢复 NOACTIVATE 和 TRANSPARENT 样式
+            if (this.IsHandleCreated && !this.IsDisposed)
+            {
+                int exStyle = GetWindowLong(this.Handle, GWL_EXSTYLE);
+                int newStyle = exStyle | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT;
+                SetWindowLong(this.Handle, GWL_EXSTYLE, newStyle);
+                SetWindowPos(this.Handle, HWND_TOPMOST, 0, 0, 0, 0,
+                    SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+            }
+
+            SetClickableMode(false);
+            SetExpanded(false);
+            RequestRender();
+        }
+
+        private void PerformSearch()
+        {
+            if (string.IsNullOrWhiteSpace(_searchText))
+            {
+                ExitSearchMode();
+                return;
+            }
+
+            string searchUrl = "https://cn.bing.com/search?q=" + Uri.EscapeDataString(_searchText);
+            try
+            {
+                Process.Start(new ProcessStartInfo
+                {
+                    FileName = searchUrl,
+                    UseShellExecute = true
+                });
+            }
+            catch (Exception ex)
+            {
+                ShowNotification($"搜索失败: {ex.Message}", TimeSpan.FromSeconds(3));
+            }
+            ExitSearchMode();
         }
 
         private Rectangle GetIslandScreenRect()
@@ -1129,7 +1963,7 @@ namespace DynamicIsland
                 _mouseTracking = true;
             }
 
-            if (_isLinkDialogActive)
+            if (_isLinkDialogActive || _isMusicMode || _isSearchMode)
             {
                 RequestRender();
             }
@@ -1139,8 +1973,24 @@ namespace DynamicIsland
         {
             _mouseTracking = false;
             _mouseInside = false;
-            // 链接弹窗模式下鼠标移出不关闭
-            if (!_isLinkDialogActive)
+
+            if (_isMusicMode && _isMusicModeExpanded)
+            {
+                MinimizeMusicMode();
+                return;
+            }
+
+            if (_isSearchMode)
+            {
+                ExitSearchMode();
+                return;
+            }
+
+            if (_isLinkDialogActive)
+            {
+                CloseLinkDialog();
+            }
+            else
             {
                 SetExpanded(false);
             }
@@ -1148,15 +1998,95 @@ namespace DynamicIsland
 
         private void Form1_MouseDown(object sender, MouseEventArgs e)
         {
-            if (!_isLinkDialogActive || e.Button != MouseButtons.Left)
-                return;
+            if (e.Button != MouseButtons.Left) return;
 
             Point clientPoint = this.PointToClient(Cursor.Position);
 
-            // 只点击打开按钮
-            if (_confirmButtonRect.Contains(clientPoint.X, clientPoint.Y))
+            if (_isSearchMode)
+            {
+                if (_searchIconRect.Contains(clientPoint.X, clientPoint.Y))
+                {
+                    DateTime now = DateTime.Now;
+                    if (now - _lastSearchTime < _searchDebounce)
+                    {
+                        return;
+                    }
+                    _lastSearchTime = now;
+                    PerformSearch();
+                    return;
+                }
+
+                if (_searchBoxRect.Contains(clientPoint.X, clientPoint.Y))
+                {
+                    // 关键修复：确保隐藏文本框获得焦点
+                    _hiddenTextBox?.Focus();
+                    _hiddenTextBox?.Select(_hiddenTextBox.Text.Length, 0);
+                    _hiddenTextBox.ImeMode = ImeMode.On;
+                    return;
+                }
+                return;
+            }
+
+            if (_isMusicMode)
+            {
+                if (!_isMusicModeExpanded)
+                {
+                    ExpandMusicMode();
+                    return;
+                }
+
+                if (_playPauseButtonRect.Contains(clientPoint.X, clientPoint.Y))
+                {
+                    if (_musicModeState != "waiting")
+                    {
+                        TogglePlayPause();
+                    }
+                    return;
+                }
+
+                if (_progressBarRect.Contains(clientPoint.X, clientPoint.Y))
+                {
+                    float percent = (clientPoint.X - _progressBarRect.X) / _progressBarRect.Width;
+                    _currentPosition = TimeSpan.FromTicks((long)(_totalDuration.Ticks * percent));
+                    if (_mediaPlayer != null)
+                    {
+                        _mediaPlayer.controls.currentPosition = percent * _totalDuration.TotalSeconds;
+                    }
+                    RequestRender();
+                    return;
+                }
+
+                return;
+            }
+
+            if (_isLinkDialogActive && _confirmButtonRect.Contains(clientPoint.X, clientPoint.Y))
             {
                 _currentContent?.OnConfirm?.Invoke();
+            }
+        }
+
+        private void Form1_KeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Alt && _isMusicMode)
+            {
+                ExitMusicMode();
+            }
+            else if (e.Control && _isSearchMode)
+            {
+                ExitSearchMode();
+            }
+        }
+
+        private void Form1_KeyPress(object sender, KeyPressEventArgs e)
+        {
+            // 搜索模式下，如果隐藏文本框没有焦点，设置焦点
+            if (_isSearchMode)
+            {
+                if (_hiddenTextBox != null && !_hiddenTextBox.Focused)
+                {
+                    _hiddenTextBox.Focus();
+                    _hiddenTextBox.Select(_hiddenTextBox.Text.Length, 0);
+                }
             }
         }
 
@@ -1222,6 +2152,30 @@ namespace DynamicIsland
                 {
                     UpdateSpringAnimation(deltaMs);
                     needsRender = true;
+
+                    if (!_isMusicMode && !_isLinkDialogActive && !_isAutoPopupActive && !_isSearchMode)
+                    {
+                        float targetProgress = _isExpanded ? 1f : 0f;
+                        float diff = targetProgress - _timeAnimationProgress;
+                        if (Math.Abs(diff) > 0.005f)
+                        {
+                            _timeAnimationProgress += diff * 0.15f;
+                            needsRender = true;
+                        }
+                        else
+                        {
+                            _timeAnimationProgress = targetProgress;
+                        }
+                    }
+                }
+                else
+                {
+                    if (!_isMusicMode && !_isLinkDialogActive && !_isAutoPopupActive && !_isSearchMode && _timeAnimationProgress > 0.005f)
+                    {
+                        _timeAnimationProgress += (0f - _timeAnimationProgress) * 0.2f;
+                        if (_timeAnimationProgress < 0.005f) _timeAnimationProgress = 0f;
+                        needsRender = true;
+                    }
                 }
 
                 if (_currentContent != null)
@@ -1246,7 +2200,7 @@ namespace DynamicIsland
                 }
 
                 if (_currentContent != null && _currentContent.Duration == TimeSpan.Zero &&
-                    _currentContent.Font == _timeFont && !_isAutoPopupActive)
+                    _currentContent.Font == _timeFont && !_isAutoPopupActive && !_isMusicMode)
                 {
                     string newTime = DateTime.Now.ToString("HH:mm:ss");
                     if (newTime != _currentContent.Text)
@@ -1254,6 +2208,16 @@ namespace DynamicIsland
                         _currentContent.Text = newTime;
                         needsRender = true;
                     }
+                }
+
+                if (_isMusicMode && _isPlaying)
+                {
+                    needsRender = true;
+                }
+
+                if (_isSearchMode)
+                {
+                    needsRender = true;
                 }
             }
 
@@ -1300,10 +2264,26 @@ namespace DynamicIsland
             expandProgress = Math.Max(0, Math.Min(1, expandProgress));
 
             int bodyAlpha = expandProgress > 0.9f ? 255 : (int)(155 + expandProgress * 100);
-            using (var brush = new SolidBrush(Color.FromArgb(bodyAlpha, 0, 0, 0)))
-            using (var path = GetRoundedRect(islandRect, radius))
+
+            if (_isMusicMode && expandProgress > 0.5f)
             {
-                g.FillPath(brush, path);
+                using (var gradientBrush = new LinearGradientBrush(
+                    new PointF(islandRect.X, islandRect.Y),
+                    new PointF(islandRect.Right, islandRect.Y),
+                    Color.FromArgb(255, 0xFF, 0x95, 0x55),
+                    Color.FromArgb(255, 0xFE, 0x83, 0xA2)))
+                using (var path = GetRoundedRect(islandRect, radius))
+                {
+                    g.FillPath(gradientBrush, path);
+                }
+            }
+            else
+            {
+                using (var brush = new SolidBrush(Color.FromArgb(bodyAlpha, 0, 0, 0)))
+                using (var path = GetRoundedRect(islandRect, radius))
+                {
+                    g.FillPath(brush, path);
+                }
             }
 
             int highlightAlpha = (int)(30 + expandProgress * 30);
@@ -1318,7 +2298,7 @@ namespace DynamicIsland
 
             DrawContent(g, islandRect);
 
-            if ((_isExpanded || _isAnimating) && !_isAutoPopupActive && expandProgress > 0.3f && !_isLinkDialogActive)
+            if ((_isExpanded || _isAnimating) && !_isAutoPopupActive && expandProgress > 0.3f && !_isLinkDialogActive && !_isMusicMode && !_isSearchMode)
             {
                 int dateAlpha = (int)(255 * Math.Min(1f, (expandProgress - 0.3f) / 0.7f));
                 string dateStr = DateTime.Now.ToString("MM/dd");
@@ -1335,6 +2315,25 @@ namespace DynamicIsland
 
         private void DrawContent(Graphics g, RectangleF islandRect)
         {
+            if (_isSearchMode)
+            {
+                DrawSearchModeContent(g, islandRect);
+                return;
+            }
+
+            if (_isMusicMode)
+            {
+                DrawMusicModeContent(g, islandRect);
+                return;
+            }
+
+            if ((_isExpanded || _timeAnimationProgress > 0.01f) && !_isLinkDialogActive && !_isAutoPopupActive
+                && _currentContent != null && _currentContent.Font == _timeFont)
+            {
+                DrawAnimatedTimeContent(g, islandRect);
+                return;
+            }
+
             if (_currentContent != null && _currentContent.CurrentAlpha > 0)
             {
                 DrawContentItem(g, islandRect, _currentContent);
@@ -1343,6 +2342,319 @@ namespace DynamicIsland
             if (_nextContent != null && _nextContent.CurrentAlpha > 0)
             {
                 DrawContentItem(g, islandRect, _nextContent);
+            }
+        }
+
+        private void DrawSearchModeContent(Graphics g, RectangleF islandRect)
+        {
+            var state = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+            float margin = 20 * _dpiScale;
+            float searchBoxHeight = 32 * _dpiScale;
+            float searchBoxY = islandRect.Y + (islandRect.Height - searchBoxHeight) / 2;
+
+            _searchBoxRect = new RectangleF(islandRect.X + margin, searchBoxY,
+                islandRect.Width - margin * 2, searchBoxHeight);
+
+            using (var bgBrush = new SolidBrush(Color.FromArgb(60, 255, 255, 255)))
+            using (var bgPath = GetRoundedRect(_searchBoxRect, 16 * _dpiScale))
+            {
+                g.FillPath(bgBrush, bgPath);
+            }
+
+            using (var borderPen = new Pen(Color.FromArgb(120, 255, 255, 255), 1.5f * _dpiScale))
+            using (var borderPath = GetRoundedRect(_searchBoxRect, 16 * _dpiScale))
+            {
+                g.DrawPath(borderPen, borderPath);
+            }
+
+            float iconSize = 16 * _dpiScale;
+            float iconMargin = 10 * _dpiScale;
+            _searchIconRect = new RectangleF(
+                _searchBoxRect.Right - iconSize - iconMargin,
+                _searchBoxRect.Y + (_searchBoxRect.Height - iconSize) / 2,
+                iconSize, iconSize);
+
+            using (var iconBrush = new SolidBrush(Color.FromArgb(200, 255, 255, 255)))
+            {
+                float circleRadius = 5 * _dpiScale;
+                float circleX = _searchIconRect.X + iconSize / 2 - circleRadius / 2;
+                float circleY = _searchIconRect.Y + iconSize / 2 - circleRadius / 2 - 4 * _dpiScale;
+
+                using (var circlePath = new GraphicsPath())
+                {
+                    circlePath.AddEllipse(circleX, circleY, circleRadius * 2, circleRadius * 2);
+                    using (var pen = new Pen(iconBrush, 2 * _dpiScale))
+                    {
+                        g.DrawPath(pen, circlePath);
+                    }
+                }
+
+                float handleStartX = circleX + circleRadius * 1.5f;
+                float handleStartY = circleY + circleRadius * 1.5f;
+                float handleEndX = handleStartX + 4 * _dpiScale;
+                float handleEndY = handleStartY + 4 * _dpiScale;
+
+                using (var pen = new Pen(iconBrush, 2 * _dpiScale))
+                {
+                    pen.StartCap = System.Drawing.Drawing2D.LineCap.Round;
+                    pen.EndCap = System.Drawing.Drawing2D.LineCap.Round;
+                    g.DrawLine(pen, handleStartX, handleStartY, handleEndX, handleEndY);
+                }
+            }
+
+            float textX = _searchBoxRect.X + 12 * _dpiScale;
+            float textWidth = _searchIconRect.Left - textX - 8 * _dpiScale;
+            var textRect = new RectangleF(textX, _searchBoxRect.Y, textWidth, _searchBoxRect.Height);
+
+            var leftFormat = new StringFormat
+            {
+                Alignment = StringAlignment.Near,
+                LineAlignment = StringAlignment.Center,
+                Trimming = StringTrimming.EllipsisCharacter
+            };
+
+            string displayText = string.IsNullOrEmpty(_searchText) ? "输入搜索内容..." : _searchText;
+
+            Font searchFont = new Font("Microsoft YaHei", 14 * _dpiScale, FontStyle.Regular, GraphicsUnit.Pixel);
+
+            Color textColor = string.IsNullOrEmpty(_searchText) ? Color.FromArgb(150, 255, 255, 255) : Color.White;
+            using (var brush = new SolidBrush(textColor))
+            {
+                g.DrawString(displayText, searchFont, brush, textRect, leftFormat);
+            }
+
+            if (!string.IsNullOrEmpty(_searchText) && _cursorVisible && _isSearchMode)
+            {
+                string textBeforeCursor = _searchText.Substring(0, Math.Min(_cursorPosition, _searchText.Length));
+                SizeF textSize = g.MeasureString(textBeforeCursor, searchFont, int.MaxValue, leftFormat);
+                float cursorX = textX + textSize.Width;
+
+                if (cursorX < _searchIconRect.Left - 4 * _dpiScale)
+                {
+                    using (var cursorBrush = new SolidBrush(Color.White))
+                    {
+                        float cursorHeight = 16 * _dpiScale;
+                        float cursorY = _searchBoxRect.Y + (_searchBoxRect.Height - cursorHeight) / 2;
+                        g.FillRectangle(cursorBrush, cursorX, cursorY, 1.5f * _dpiScale, cursorHeight);
+                    }
+                }
+            }
+
+            searchFont.Dispose();
+            g.Restore(state);
+        }
+
+        private void DrawAnimatedTimeContent(Graphics g, RectangleF islandRect)
+        {
+            var state = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+            string timeText = DateTime.Now.ToString("HH:mm:ss");
+
+            float smallSize = _timeFont.Size;
+            float largeSize = _largeTimeFont.Size;
+            float currentSize = smallSize + (largeSize - smallSize) * _timeAnimationProgress;
+
+            using (var timeFont = new Font("Microsoft YaHei", currentSize, FontStyle.Bold, GraphicsUnit.Pixel))
+            using (var brush = new SolidBrush(Color.White))
+            {
+                float centerY = islandRect.Y + islandRect.Height / 2 - currentSize / 2;
+                float expandedY = islandRect.Y + 18 * _dpiScale;
+                float currentY = centerY + (expandedY - centerY) * _timeAnimationProgress;
+
+                var timeRect = new RectangleF(islandRect.X, currentY, islandRect.Width, currentSize * 1.2f);
+                g.DrawString(timeText, timeFont, brush, timeRect, _stringFormat);
+            }
+
+            if (_timeAnimationProgress > 0.05f)
+            {
+                int hintAlpha = (int)(255 * _timeAnimationProgress);
+                using (var brush = new SolidBrush(Color.FromArgb(hintAlpha, 180, 180, 180)))
+                {
+                    float hintBaseY = islandRect.Y + islandRect.Height / 2 + 8 * _dpiScale;
+                    float hintTargetY = islandRect.Y + 45 * _dpiScale;
+                    float currentHintY = hintBaseY + (hintTargetY - hintBaseY) * _timeAnimationProgress;
+
+                    var hintRect = new RectangleF(islandRect.X, currentHintY, islandRect.Width, 20 * _dpiScale);
+                    g.DrawString("Alt 音乐 | Ctrl 搜索", _hintFont, brush, hintRect, _stringFormat);
+                }
+            }
+
+            g.Restore(state);
+        }
+
+        private void DrawMusicModeContent(Graphics g, RectangleF islandRect)
+        {
+            var state = g.Save();
+            g.SmoothingMode = SmoothingMode.AntiAlias;
+            g.TextRenderingHint = System.Drawing.Text.TextRenderingHint.AntiAliasGridFit;
+
+            if (!_isMusicModeExpanded)
+            {
+                using (var brush = new SolidBrush(Color.White))
+                {
+                    string timeText = DateTime.Now.ToString("HH:mm:ss");
+                    var timeRect = new RectangleF(islandRect.X, islandRect.Y + (islandRect.Height - _timeFont.Size) / 2,
+                        islandRect.Width, _timeFont.Size * 1.2f);
+                    g.DrawString(timeText, _timeFont, brush, timeRect, _stringFormat);
+                }
+                g.Restore(state);
+                return;
+            }
+
+            float margin = 15 * _dpiScale;
+            float topMargin = 10 * _dpiScale;
+
+            if (_musicModeState == "waiting")
+            {
+                using (var brush = new SolidBrush(Color.White))
+                {
+                    float waitingFontSize = 16f * _dpiScale;
+                    using (var waitingFont = new Font("Microsoft YaHei", waitingFontSize, FontStyle.Bold, GraphicsUnit.Pixel))
+                    {
+                        var hintRect = new RectangleF(islandRect.X, islandRect.Y + (islandRect.Height - 24 * _dpiScale) / 2,
+                            islandRect.Width, 24 * _dpiScale);
+                        g.DrawString("请拖入音频文件", waitingFont, brush, hintRect, _stringFormat);
+                    }
+                }
+                g.Restore(state);
+                return;
+            }
+
+            float controlY = islandRect.Y + (islandRect.Height - 24 * _dpiScale) / 2;
+
+            float playButtonSize = 28 * _dpiScale;
+            _playPauseButtonRect = new RectangleF(islandRect.X + margin, controlY - 2 * _dpiScale, playButtonSize, playButtonSize);
+
+            using (var buttonBrush = new SolidBrush(Color.FromArgb(220, 255, 255, 255)))
+            using (var buttonPath = new GraphicsPath())
+            {
+                buttonPath.AddEllipse(_playPauseButtonRect);
+                g.FillPath(buttonBrush, buttonPath);
+            }
+
+            using (var iconBrush = new SolidBrush(Color.FromArgb(255, 0xFF, 0x95, 0x55)))
+            {
+                if (_isPlaying)
+                {
+                    float barWidth = 3 * _dpiScale;
+                    float barHeight = 10 * _dpiScale;
+                    float centerX = _playPauseButtonRect.X + _playPauseButtonRect.Width / 2;
+                    float centerY = _playPauseButtonRect.Y + _playPauseButtonRect.Height / 2;
+                    g.FillRectangle(iconBrush, centerX - barWidth - 1, centerY - barHeight / 2, barWidth, barHeight);
+                    g.FillRectangle(iconBrush, centerX + 1, centerY - barHeight / 2, barWidth, barHeight);
+                }
+                else
+                {
+                    float triangleSize = 10 * _dpiScale;
+                    float centerX = _playPauseButtonRect.X + _playPauseButtonRect.Width / 2 - 1;
+                    float centerY = _playPauseButtonRect.Y + _playPauseButtonRect.Height / 2;
+                    float triangleWidth = triangleSize * 0.8f;
+                    var triangle = new PointF[]
+                    {
+                        new PointF(centerX - triangleWidth / 3, centerY - triangleSize / 2),
+                        new PointF(centerX - triangleWidth / 3, centerY + triangleSize / 2),
+                        new PointF(centerX + triangleWidth / 1.5f, centerY)
+                    };
+                    g.FillPolygon(iconBrush, triangle);
+                }
+            }
+
+            string displayFileName = TruncateFileName(_currentFileName, 22);
+            float textStartX = _playPauseButtonRect.Right + 10 * _dpiScale;
+            float textWidth = islandRect.Width - textStartX - margin * 2 - 45 * _dpiScale;
+
+            using (var brush = new SolidBrush(Color.White))
+            {
+                var fileNameRect = new RectangleF(textStartX, islandRect.Y + 18 * _dpiScale,
+                    textWidth, 18 * _dpiScale);
+                var leftFormat = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
+                g.DrawString(displayFileName, _musicFileFont, brush, fileNameRect, leftFormat);
+            }
+
+            string progressText = $"{_currentPosition:mm\\:ss}/{_totalDuration:mm\\:ss}";
+            using (var brush = new SolidBrush(Color.FromArgb(200, 255, 255, 255)))
+            {
+                var timeRect = new RectangleF(textStartX, islandRect.Y + 36 * _dpiScale,
+                    textWidth, 16 * _dpiScale);
+                var leftFormat = new StringFormat { Alignment = StringAlignment.Near, LineAlignment = StringAlignment.Center };
+                g.DrawString(progressText, _musicTimeFont, brush, timeRect, leftFormat);
+            }
+
+            float progressBarY = islandRect.Y + islandRect.Height - 12 * _dpiScale;
+            float progressBarHeight = 4 * _dpiScale;
+            float progressBarMargin = margin * 1.5f;
+            float progressBarWidth = islandRect.Width - progressBarMargin * 2;
+            float progressBarX = islandRect.X + progressBarMargin;
+            _progressBarRect = new RectangleF(progressBarX, progressBarY, progressBarWidth, progressBarHeight);
+
+            using (var bgBrush = new SolidBrush(Color.FromArgb(100, 255, 255, 255)))
+            using (var bgPath = GetRoundedRect(_progressBarRect, progressBarHeight / 2))
+            {
+                g.FillPath(bgBrush, bgPath);
+            }
+
+            float progressPercent = _totalDuration.TotalSeconds > 0 ?
+                (float)(_currentPosition.TotalSeconds / _totalDuration.TotalSeconds) : 0;
+            float fillWidth = _progressBarRect.Width * progressPercent;
+            if (fillWidth > 0)
+            {
+                var fillRect = new RectangleF(_progressBarRect.X, _progressBarRect.Y, fillWidth, _progressBarRect.Height);
+                using (var fillBrush = new SolidBrush(Color.White))
+                using (var fillPath = GetRoundedRect(fillRect, progressBarHeight / 2))
+                {
+                    g.FillPath(fillBrush, fillPath);
+                }
+            }
+
+            DrawAudioVisualizerBars(g, islandRect);
+
+            g.Restore(state);
+        }
+
+        private void DrawAudioVisualizerBars(Graphics g, RectangleF islandRect)
+        {
+            int barCount = 8;
+            float barWidth = 3.5f * _dpiScale;
+            float barSpacing = 2.5f * _dpiScale;
+            float maxBarHeight = 22 * _dpiScale;
+
+            float totalBarsWidth = barCount * barWidth + (barCount - 1) * barSpacing;
+
+            float rightMargin = 18 * _dpiScale;
+            float visualizerX = islandRect.Right - totalBarsWidth - rightMargin;
+            float visualizerY = islandRect.Y + 24 * _dpiScale;
+
+            for (int i = 0; i < barCount; i++)
+            {
+                float barValue = _audioBars[i];
+
+                float barHeight = maxBarHeight * barValue;
+                float minDisplayHeight = 4 * _dpiScale;
+                if (barHeight < minDisplayHeight) barHeight = minDisplayHeight;
+
+                if (barHeight > maxBarHeight) barHeight = maxBarHeight;
+
+                float x = visualizerX + i * (barWidth + barSpacing);
+                float y = visualizerY + (maxBarHeight - barHeight);
+
+                var barRect = new RectangleF(x, y, barWidth, barHeight);
+
+                float intensity = barValue;
+                int alpha = 160 + (int)(95 * intensity);
+                if (alpha > 255) alpha = 255;
+
+                Color barColor = Color.FromArgb(alpha, 255, 255, 255);
+
+                using (var barBrush = new SolidBrush(barColor))
+                using (var barPath = GetRoundedRect(barRect, barWidth / 2))
+                {
+                    g.FillPath(barBrush, barPath);
+                }
             }
         }
 
@@ -1390,7 +2702,6 @@ namespace DynamicIsland
             var linkColor = Color.FromArgb(alpha, item.SubColor.R, item.SubColor.G, item.SubColor.B);
             var buttonColor = Color.FromArgb(alpha, 76, 175, 80);
 
-            // 第一行：提示文字（白色，稍大，靠左对齐）
             using (var brush = new SolidBrush(whiteColor))
             {
                 var leftFormat = new StringFormat
@@ -1399,23 +2710,20 @@ namespace DynamicIsland
                     LineAlignment = StringAlignment.Center
                 };
                 float leftMargin = 15 * _dpiScale;
-                var promptRect = new RectangleF(islandRect.X + leftMargin, islandRect.Y + 8 * _dpiScale,
+                var promptRect = new RectangleF(islandRect.X + leftMargin, islandRect.Y + 10 * _dpiScale,
                     islandRect.Width - leftMargin * 2, 22 * _dpiScale);
                 g.DrawString(item.Text, item.Font, brush, promptRect, leftFormat);
             }
 
-            // 第二行：链接和按钮放在同一行
-            float row2Y = islandRect.Y + 35 * _dpiScale;
-            float buttonWidth = 55 * _dpiScale;
-            float buttonHeight = 24 * _dpiScale;
-            float spacing = 15 * _dpiScale;
+            float row2Y = islandRect.Y + 32 * _dpiScale;
+            float buttonWidth = 50 * _dpiScale;
+            float buttonHeight = 22 * _dpiScale;
+            float spacing = 18 * _dpiScale;
 
-            // 计算链接文本区域（左侧）
             string linkText = item.SubText;
             SizeF linkSize = g.MeasureString(linkText, item.SubFont ?? _linkFont);
             float availableWidth = islandRect.Width - buttonWidth - spacing * 3;
 
-            // 如果链接太长，截断
             if (linkSize.Width > availableWidth)
             {
                 int maxChars = linkText.Length;
@@ -1427,11 +2735,10 @@ namespace DynamicIsland
                     linkText = linkText.Substring(0, maxChars) + "...";
             }
 
-            // 绘制链接（左侧，不可点击，白色偏灰）
             float linkX = islandRect.X + spacing;
             float linkWidth = Math.Min(linkSize.Width, availableWidth);
 
-            using (var brush = new SolidBrush(linkColor))
+            using (var brush = new SolidBrush(Color.FromArgb(alpha, 200, 200, 200)))
             {
                 var format = new StringFormat
                 {
@@ -1442,7 +2749,6 @@ namespace DynamicIsland
                 g.DrawString(linkText, item.SubFont ?? _linkFont, brush, linkRect, format);
             }
 
-            // 绘制"打开"按钮（右侧）
             float buttonX = islandRect.Right - buttonWidth - spacing;
             _confirmButtonRect = new RectangleF(buttonX, row2Y, buttonWidth, buttonHeight);
             DrawButton(g, _confirmButtonRect, "打开", buttonColor, whiteColor, alpha);
@@ -1462,7 +2768,7 @@ namespace DynamicIsland
             }
 
             using (var brush = new SolidBrush(bgColor))
-            using (var path = GetRoundedRect(rect, 6 * _dpiScale))
+            using (var path = GetRoundedRect(rect, 12 * _dpiScale))
             {
                 g.FillPath(brush, path);
             }
@@ -1474,7 +2780,8 @@ namespace DynamicIsland
                     Alignment = StringAlignment.Center,
                     LineAlignment = StringAlignment.Center
                 };
-                g.DrawString(text, _buttonFont, brush, rect, format);
+                var textRect = new RectangleF(rect.X, rect.Y + 3 * _dpiScale, rect.Width, rect.Height);
+                g.DrawString(text, _buttonFont, brush, textRect, format);
             }
         }
 
@@ -1588,13 +2895,21 @@ namespace DynamicIsland
 
         protected override void WndProc(ref Message m)
         {
-            if (m.Msg == WM_SHOWINSTANCE_MESSAGE)
+            if (m.Msg == WM_SHOWINSTANCE_MESSAGE && WM_SHOWINSTANCE_MESSAGE != 0)
             {
                 this.BeginInvoke(new Action(() =>
                 {
-                    ShowNotification("请勿重复启动", TimeSpan.FromSeconds(2), customColor: Color.FromArgb(180, 229, 162));
+                    try
+                    {
+                        ShowNotification("程序重复启动", TimeSpan.FromSeconds(2), customColor: Color.FromArgb(180, 229, 162));
+                    }
+                    catch (Exception ex)
+                    {
+                        Debug.WriteLine($"ShowNotification error: {ex.Message}");
+                    }
                 }));
-                m.Result = IntPtr.Zero;
+
+                m.Result = new IntPtr(1);
                 return;
             }
 
